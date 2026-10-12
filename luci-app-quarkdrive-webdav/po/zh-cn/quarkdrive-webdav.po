@@ -5,8 +5,8 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-msgid "QuarkDrive WebDAV"
-msgstr "夸克网盘 WebDAV"
+msgid "QuarkDrive"
+msgstr "夸克网盘"
 
 msgid "Expose your QuarkDrive files through WebDAV. The backend package is optional; you can deploy a compatible binary yourself."
 msgstr "通过 WebDAV 访问夸克网盘文件。无需安装后端软件包，也可自行部署兼容的二进制程序。"
@@ -74,20 +74,8 @@ msgstr "只读模式"
 msgid "Prevent uploads, changes and deletions through WebDAV."
 msgstr "禁止通过 WebDAV 上传、修改和删除文件。"
 
-msgid "Generate directory index"
-msgstr "生成目录索引"
-
-msgid "Delete permanently"
-msgstr "永久删除"
-
-msgid "Delete files permanently instead of moving them to the trash."
-msgstr "直接永久删除文件，而不是移入回收站。"
-
 msgid "Download buffer size (bytes)"
 msgstr "下载缓冲区大小（字节）"
-
-msgid "Upload buffer size (bytes)"
-msgstr "上传缓冲区大小（字节）"
 
 msgid "Directory cache size"
 msgstr "目录缓存容量"
@@ -112,9 +100,6 @@ msgstr "使用反向代理时，从收到的请求路径中移除此 URL 前缀�
 
 msgid "Skip same-size uploads"
 msgstr "跳过同大小文件上传"
-
-msgid "Prefer HTTP downloads"
-msgstr "优先使用 HTTP 下载"
 
 msgid "Enable redirects when possible"
 msgstr "允许可用的重定向"
@@ -142,6 +127,9 @@ msgstr "停止"
 
 msgid "Restart"
 msgstr "重启"
+
+msgid "Open"
+msgstr "打开"
 
 msgid "Service operation failed."
 msgstr "服务操作失败。"

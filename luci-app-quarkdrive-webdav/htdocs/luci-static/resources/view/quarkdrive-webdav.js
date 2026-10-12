@@ -52,8 +52,26 @@ return view.extend({
 			}, item[1]);
 			controls.push(button, ' ');
 		});
+		const openButton = E('button', {
+			'class': 'btn cbi-button',
+			'type': 'button',
+			'click': () => {
+				let host = uci.get(serviceName, 'config', 'host') || '0.0.0.0';
+				if (host === '0.0.0.0' || host === '::' || host === '[::]')
+					host = window.location.hostname;
+				if (host.indexOf(':') !== -1 && host.charAt(0) !== '[')
+					host = '[' + host + ']';
 
-		m = new form.Map(serviceName, _('QuarkDrive WebDAV'),
+				const url = new URL('http://' + host);
+				url.port = uci.get(serviceName, 'config', 'port') || '8080';
+				const prefix = uci.get(serviceName, 'config', 'strip_prefix') || '';
+				url.pathname = prefix.split('/').map(encodeURIComponent).join('/').replace(/\/+$/, '') + '/';
+				window.open(url.href, '_blank', 'noopener,noreferrer');
+			}
+		}, _('Open'));
+		controls.push(openButton);
+
+		m = new form.Map(serviceName, _('QuarkDrive'),
 			_('Expose your QuarkDrive files through WebDAV. The backend package is optional; you can deploy a compatible binary yourself.') + '<br />' +
 			_('This backend serves HTTP only. Use a reverse proxy for HTTPS and do not expose an unauthenticated server to the Internet.'));
 
@@ -106,14 +124,9 @@ return view.extend({
 
 		o = s.taboption('basic', form.Flag, 'read_only', _('Read-only mode'));
 		o.description = _('Prevent uploads, changes and deletions through WebDAV.');
-		o = s.taboption('basic', form.Flag, 'auto_index', _('Generate directory index'));
-		o.default = o.disabled;
-		o = s.taboption('basic', form.Flag, 'no_trash', _('Delete permanently'));
-		o.description = _('Delete files permanently instead of moving them to the trash.');
 
 		[
 			['read_buffer_size', _('Download buffer size (bytes)'), '10485760', 'and(uinteger,min(1))'],
-			['upload_buffer_size', _('Upload buffer size (bytes)'), '16777216', 'and(uinteger,min(1))'],
 			['cache_size', _('Directory cache size'), '1000', 'uinteger'],
 			['cache_ttl', _('Directory cache TTL (seconds)'), '600', 'uinteger'],
 			['refresh_cache_secs_interval', _('Cache refresh interval (seconds)'), '300', 'and(uinteger,min(1))'],
@@ -130,7 +143,6 @@ return view.extend({
 		o.validate = absolutePath;
 		o.description = _('Remove this prefix from incoming request paths when using a reverse proxy.');
 		o = s.taboption('advanced', form.Flag, 'skip_upload_same_size', _('Skip same-size uploads'));
-		o = s.taboption('advanced', form.Flag, 'prefer_http_download', _('Prefer HTTP downloads'));
 		o = s.taboption('advanced', form.Flag, 'redirect', _('Enable redirects when possible'));
 		o = s.taboption('advanced', form.Flag, 'debug', _('Enable debug logging'));
 		o.description = _('Debug logs may contain sensitive information. Disable this after troubleshooting.');
@@ -140,7 +152,7 @@ return view.extend({
 
 		return m.render().then(map => {
 			controls.forEach(button => {
-				if (typeof button !== 'string')
+				if (typeof button !== 'string' && button !== openButton)
 					button.disabled = m.readonly;
 			});
 			poll.add(() => Promise.all([

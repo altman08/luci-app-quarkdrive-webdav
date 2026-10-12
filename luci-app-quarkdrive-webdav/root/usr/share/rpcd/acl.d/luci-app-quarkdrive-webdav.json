@@ -1,6 +1,6 @@
 {
 	"luci-app-quarkdrive-webdav": {
-		"description": "Grant access to QuarkDrive WebDAV configuration and service logs",
+		"description": "Grant access to QuarkDrive configuration and service logs",
 		"read": {
 			"uci": [ "quarkdrive-webdav" ],
 			"ubus": {

@@ -84,7 +84,6 @@ start_service() {
 		return 1
 	fi
 	valid_number read_buffer_size positive || return 1
-	valid_number upload_buffer_size positive || return 1
 	valid_number cache_size || return 1
 	valid_number cache_ttl || return 1
 	valid_number refresh_cache_secs_interval positive || return 1
@@ -109,17 +108,13 @@ start_service() {
 	append_arg -p port "8080"
 	append_arg --root root "/"
 	append_arg --read-buffer-size read_buffer_size "10485760"
-	append_arg --upload-buffer-size upload_buffer_size "16777216"
 	append_arg --cache-size cache_size "1000"
 	append_arg --cache-ttl cache_ttl "600"
 	append_arg --refresh-cache-secs-interval refresh_cache_secs_interval "300"
 	append_arg --upload-wait-timeout upload_wait_timeout "280"
 	append_arg --strip-prefix strip_prefix
-	append_bool --auto-index auto_index
-	append_bool --no-trash no_trash
 	append_bool --read-only read_only
 	append_bool --skip-upload-same-size skip_upload_same_size
-	append_bool --prefer-http-download prefer_http_download
 	append_bool --redirect redirect
 	append_bool --debug debug
 
