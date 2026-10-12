@@ -134,6 +134,9 @@ msgstr "打开"
 msgid "Service operation failed."
 msgstr "服务操作失败。"
 
+msgid "Unable to read service status."
+msgstr "无法读取服务状态。"
+
 msgid "Unable to read service logs."
 msgstr "无法读取服务日志。"
 

@@ -35,27 +35,75 @@ return view.extend({
 			'style': 'width:100%;font-family:monospace'
 		});
 		const controls = [];
+		const serviceButtons = {};
+		let running = null;
+		let busy = false;
+		let statusRequest = 0;
+		const setButtonState = (button, disabled, style) => {
+			button.disabled = !!disabled;
+			button.className = 'btn cbi-button' + (disabled ? '' : ' ' + style);
+		};
+		const updateButtons = () => {
+			Object.keys(serviceButtons).forEach(action => {
+				const item = serviceButtons[action];
+				const disabled = busy || m.readonly || running === null ||
+					(action === 'start' && running) || (action === 'stop' && !running);
+				setButtonState(item.button, disabled, item.style);
+			});
+			setButtonState(openButton, busy || running !== true, 'cbi-button-action');
+		};
+		const refreshStatus = () => {
+			const request = ++statusRequest;
+			return callServiceList(serviceName).then(result => {
+				if (request !== statusRequest)
+					return;
+				const instances = (result[serviceName] || {}).instances || {};
+				running = Object.keys(instances).some(key => instances[key].running);
+				status.textContent = running ? _('RUNNING') : _('NOT RUNNING');
+				status.style.color = running ? 'green' : 'red';
+			}).catch(() => {
+				if (request !== statusRequest)
+					return;
+				running = null;
+				status.textContent = _('Unable to read service status.');
+				status.style.color = '';
+			}).finally(updateButtons);
+		};
 		const runAction = (action, button) => {
-			button.disabled = true;
+			if (button.disabled || busy || m.readonly)
+				return Promise.resolve();
+			busy = true;
+			++statusRequest;
+			updateButtons();
 			return fs.exec(initPath, [action]).then(result => {
 				if (result.code !== 0)
 					throw new Error(result.stderr || _('Service operation failed.'));
 			}).catch(error => {
 				ui.addNotification(null, E('p', {}, error.message));
-			}).finally(() => { button.disabled = m.readonly; });
+			}).finally(() => refreshStatus().finally(() => {
+				busy = false;
+				updateButtons();
+			}));
 		};
-		[['start', _('Start')], ['stop', _('Stop')], ['restart', _('Restart')]].forEach(item => {
+		[
+			['start', _('Start'), 'cbi-button-positive'],
+			['stop', _('Stop'), 'cbi-button-negative'],
+			['restart', _('Restart'), 'cbi-button-reload']
+		].forEach(item => {
 			const button = E('button', {
-				'class': 'btn cbi-button',
+				'class': 'btn cbi-button ' + item[2],
 				'type': 'button',
 				'click': ev => runAction(item[0], ev.currentTarget)
 			}, item[1]);
+			serviceButtons[item[0]] = { button: button, style: item[2] };
 			controls.push(button, ' ');
 		});
 		const openButton = E('button', {
-			'class': 'btn cbi-button',
+			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',
 			'click': () => {
+				if (openButton.disabled)
+					return;
 				let host = uci.get(serviceName, 'config', 'host') || '0.0.0.0';
 				if (host === '0.0.0.0' || host === '::' || host === '[::]')
 					host = window.location.hostname;
@@ -151,17 +199,9 @@ return view.extend({
 		o.renderWidget = () => logs;
 
 		return m.render().then(map => {
-			controls.forEach(button => {
-				if (typeof button !== 'string' && button !== openButton)
-					button.disabled = m.readonly;
-			});
+			updateButtons();
 			poll.add(() => Promise.all([
-				L.resolveDefault(callServiceList(serviceName), {}).then(result => {
-					const instances = (result[serviceName] || {}).instances || {};
-					const running = Object.keys(instances).some(key => instances[key].running);
-					status.textContent = running ? _('RUNNING') : _('NOT RUNNING');
-					status.style.color = running ? 'green' : 'red';
-				}),
+				refreshStatus(),
 				fs.exec(initPath, ['log']).then(result => {
 					if (result.code !== 0)
 						throw new Error(result.stderr || _('Unable to read service logs.'));
@@ -175,14 +215,14 @@ return view.extend({
 				}).catch(error => { logs.value = error.message; })
 			]), 5);
 
-			return E('div', {}, [
+			return refreshStatus().then(() => E('div', {}, [
 				E('div', { 'class': 'cbi-section' }, [
 					E('p', {}, [status]),
 					E('p', {}, controls),
 					E('p', {}, _('Save & Apply before starting or restarting. Start requires Enable to be checked.'))
 				]),
 				map
-			]);
+			]));
 		});
 	}
 });
