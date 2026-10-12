@@ -128,9 +128,16 @@ return view.extend({
 		s.tab('advanced', _('Advanced settings'));
 		s.tab('log', _('Service log'));
 
-		o = s.taboption('basic', form.Flag, 'enabled', _('Enable'));
+		o = s.taboption('basic', form.Flag, 'enabled', _('Start on boot'));
 		o.default = o.disabled;
 		o.rmempty = false;
+
+		o = s.taboption('basic', form.DummyValue, '_status', _('Service status'));
+		o.renderWidget = () => status;
+
+		o = s.taboption('basic', form.DummyValue, '_actions', _('Service control'));
+		o.renderWidget = () => E('div', {}, controls);
+		o.description = _('Save & Apply before starting or restarting.');
 
 		o = s.taboption('basic', form.Value, 'binary_path', _('Binary path'));
 		o.default = '/usr/bin/quarkdrive-webdav';
@@ -143,7 +150,7 @@ return view.extend({
 		o.description = _('Copy the complete Cookie header from a logged-in QuarkDrive browser session.');
 		o.validate = function(sectionId, value) {
 			const enabled = this.map.lookupOption('enabled', sectionId)[0].formvalue(sectionId);
-			return enabled !== '1' || !!value || _('A QuarkDrive cookie is required when the service is enabled.');
+			return enabled !== '1' || !!value || _('A QuarkDrive cookie is required for automatic startup.');
 		};
 
 		o = s.taboption('basic', form.Value, 'host', _('Listen address'));
@@ -215,14 +222,7 @@ return view.extend({
 				}).catch(error => { logs.value = error.message; })
 			]), 5);
 
-			return refreshStatus().then(() => E('div', {}, [
-				E('div', { 'class': 'cbi-section' }, [
-					E('p', {}, [status]),
-					E('p', {}, controls),
-					E('p', {}, _('Save & Apply before starting or restarting. Start requires Enable to be checked.'))
-				]),
-				map
-			]));
+			return refreshStatus().then(() => map);
 		});
 	}
 });

@@ -23,8 +23,14 @@ msgstr "高级设置"
 msgid "Service log"
 msgstr "服务日志"
 
-msgid "Enable"
-msgstr "启用"
+msgid "Start on boot"
+msgstr "开机自启"
+
+msgid "Service status"
+msgstr "服务状态"
+
+msgid "Service control"
+msgstr "服务控制"
 
 msgid "Binary path"
 msgstr "二进制路径"
@@ -41,8 +47,8 @@ msgstr "夸克网盘 Cookie"
 msgid "Copy the complete Cookie header from a logged-in QuarkDrive browser session."
 msgstr "从已登录夸克网盘的浏览器会话中复制完整的 Cookie 请求头。"
 
-msgid "A QuarkDrive cookie is required when the service is enabled."
-msgstr "启用服务时必须填写夸克网盘 Cookie。"
+msgid "A QuarkDrive cookie is required for automatic startup."
+msgstr "开启自动启动时必须填写夸克网盘 Cookie。"
 
 msgid "Listen address"
 msgstr "监听地址"
@@ -143,5 +149,5 @@ msgstr "无法读取服务日志。"
 msgid "No service logs yet."
 msgstr "暂无服务日志。"
 
-msgid "Save & Apply before starting or restarting. Start requires Enable to be checked."
-msgstr "启动或重启前请先保存并应用配置，启动服务需要勾选“启用”。"
+msgid "Save & Apply before starting or restarting."
+msgstr "启动或重启前请先保存并应用配置。"
