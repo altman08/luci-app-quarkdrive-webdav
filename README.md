@@ -1,6 +1,8 @@
 # luci-app-quarkdrive-webdav
 
-面向 OpenWrt / ImmortalWrt 的夸克网盘 WebDAV 插件，使用 LuCI 配置参数，由 procd 管理 `quarkdrive-webdav` 服务。
+服务端项目：[chenqimiao/quarkdrive-webdav](https://github.com/chenqimiao/quarkdrive-webdav)。感谢作者 chenqimiao 的开源分享。
+
+本项目是面向 OpenWrt / ImmortalWrt 的夸克网盘 LuCI 控制插件，用于配置和管理 `quarkdrive-webdav` 服务。
 
 ## 软件包与功能
 
