@@ -1,0 +1,6 @@
+#!/bin/sh
+
+# The cookie and WebDAV password must not be readable by other users.
+chmod 0600 /etc/config/quarkdrive-webdav
+/etc/init.d/quarkdrive-webdav enable
+exit 0

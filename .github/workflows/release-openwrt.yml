@@ -1,0 +1,176 @@
+name: Release OpenWrt packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        type: string
+      prerelease:
+        description: Mark as prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  openwrt-packages:
+    name: OpenWrt ${{ matrix.sdk }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_generic
+          - arm_cortex-a7
+          - arm_cortex-a9
+        sdk:
+          - '25.12.5'
+
+    steps:
+      - name: Validate release tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git check-ref-format "refs/tags/${TAG}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build OpenWrt packages
+        uses: openwrt/gh-action-sdk@v11
+        # rust/host builds LLVM, rustc and Cargo from source on a cold SDK.
+        timeout-minutes: 330
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEED_DIR: ${{ github.workspace }}
+          NO_SHFMT_CHECK: true
+          NO_REFRESH_CHECK: true
+          # LuCI builds the zh-cn translation from po/zh_Hans as a subpackage
+          # of luci-app-quarkdrive-webdav; it is not a separate source build target.
+          PACKAGES: quarkdrive-webdav luci-app-quarkdrive-webdav
+          V: sc
+
+      - name: Collect project packages
+        env:
+          ARCH: ${{ matrix.arch }}
+          SDK: ${{ matrix.sdk }}
+        run: |
+          set -euo pipefail
+          package_dir="bin/packages/${ARCH}/action"
+          shopt -s nullglob
+          backend=("${package_dir}"/quarkdrive-webdav_*.ipk "${package_dir}"/quarkdrive-webdav-[0-9]*.apk)
+          frontend=("${package_dir}"/luci-app-quarkdrive-webdav_*.ipk "${package_dir}"/luci-app-quarkdrive-webdav-[0-9]*.apk)
+          translations=("${package_dir}"/luci-i18n-quarkdrive-webdav-zh-cn_*.ipk "${package_dir}"/luci-i18n-quarkdrive-webdav-zh-cn-[0-9]*.apk)
+          if ((${#backend[@]} == 0 || ${#frontend[@]} == 0 || ${#translations[@]} == 0)); then
+            echo "::error::Expected quarkdrive-webdav, luci-app-quarkdrive-webdav and luci-i18n-quarkdrive-webdav-zh-cn in ${package_dir}"
+            exit 1
+          fi
+          mkdir -p release
+          # Do not publish dependency packages; distinguish universal LuCI
+          # packages by SDK and architecture to avoid release name collisions.
+          for package in "${backend[@]}" "${frontend[@]}" "${translations[@]}"; do
+            filename=$(basename "$package")
+            extension="${filename##*.}"
+            stem="${filename%.*}"
+            cp "$package" "release/${stem}_openwrt-${SDK}_${ARCH}.${extension}"
+          done
+          (
+            cd release
+            packages=(*.ipk *.apk)
+            sha256sum "${packages[@]}" > "sha256sums_openwrt-${SDK}_${ARCH}"
+          )
+
+      - name: Upload OpenWrt packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarkdrive-webdav-openwrt-${{ matrix.sdk }}-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarkdrive-webdav-build-logs-${{ matrix.sdk }}-${{ matrix.arch }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish OpenWrt packages
+    needs: openwrt-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download OpenWrt packages
+        uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        with:
+          pattern: quarkdrive-webdav-openwrt-*
+          path: release
+          merge-multiple: true
+
+      - name: Create release and upload packages
+        timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          TARGET: ${{ github.sha }}
+          GH_PROMPT_DISABLED: '1'
+        run: |
+          set -euo pipefail
+          retry() {
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout --kill-after=5s 90s "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          # A failed lookup can also mean a network error. Check again on
+          # retries so a completed-but-timed-out creation remains idempotent.
+          ensure_release() {
+            if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+              return 0
+            fi
+            local args=(
+              "$TAG"
+              --repo "$REPOSITORY"
+              --target "$TARGET"
+              --title "$TAG"
+              --generate-notes
+            )
+            if [ "$PRERELEASE" = true ]; then
+              args+=(--prerelease)
+            fi
+            gh release create "${args[@]}"
+          }
+          export -f ensure_release
+          retry bash -c ensure_release
+          retry gh release upload "$TAG" release/* --repo "$REPOSITORY" --clobber

@@ -1,0 +1,23 @@
+{
+	"luci-app-quarkdrive-webdav": {
+		"description": "Grant access to QuarkDrive WebDAV configuration and service logs",
+		"read": {
+			"uci": [ "quarkdrive-webdav" ],
+			"ubus": {
+				"service": [ "list" ],
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/etc/init.d/quarkdrive-webdav log": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "quarkdrive-webdav" ],
+			"file": {
+				"/etc/init.d/quarkdrive-webdav start": [ "exec" ],
+				"/etc/init.d/quarkdrive-webdav stop": [ "exec" ],
+				"/etc/init.d/quarkdrive-webdav restart": [ "exec" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,14 @@
+{
+	"admin/services/quarkdrive-webdav": {
+		"title": "QuarkDrive WebDAV",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "quarkdrive-webdav"
+		},
+		"depends": {
+			"acl": [ "luci-app-quarkdrive-webdav" ],
+			"uci": { "quarkdrive-webdav": true }
+		}
+	}
+}

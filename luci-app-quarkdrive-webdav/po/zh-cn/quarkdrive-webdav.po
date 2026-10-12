@@ -1,0 +1,156 @@
+msgid ""
+msgstr ""
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "QuarkDrive WebDAV"
+msgstr "夸克网盘 WebDAV"
+
+msgid "Expose your QuarkDrive files through WebDAV. The backend package is optional; you can deploy a compatible binary yourself."
+msgstr "通过 WebDAV 访问夸克网盘文件。无需安装后端软件包，也可自行部署兼容的二进制程序。"
+
+msgid "This backend serves HTTP only. Use a reverse proxy for HTTPS and do not expose an unauthenticated server to the Internet."
+msgstr "当前后端仅提供 HTTP 服务。如需 HTTPS，请使用反向代理；请勿将未设置身份验证的服务暴露到互联网。"
+
+msgid "Basic settings"
+msgstr "基本设置"
+
+msgid "Advanced settings"
+msgstr "高级设置"
+
+msgid "Service log"
+msgstr "服务日志"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Binary path"
+msgstr "二进制路径"
+
+msgid "Use an absolute path beginning with /."
+msgstr "请使用以 / 开头的绝对路径。"
+
+msgid "Absolute path to an executable quarkdrive-webdav binary, for example /mnt/sda1/quarkdrive-webdav. It must match your router architecture."
+msgstr "可执行的 quarkdrive-webdav 二进制程序的绝对路径，例如 /mnt/sda1/quarkdrive-webdav。程序必须适配路由器架构。"
+
+msgid "QuarkDrive Cookie"
+msgstr "夸克网盘 Cookie"
+
+msgid "Copy the complete Cookie header from a logged-in QuarkDrive browser session."
+msgstr "从已登录夸克网盘的浏览器会话中复制完整的 Cookie 请求头。"
+
+msgid "A QuarkDrive cookie is required when the service is enabled."
+msgstr "启用服务时必须填写夸克网盘 Cookie。"
+
+msgid "Listen address"
+msgstr "监听地址"
+
+msgid "Listen port"
+msgstr "监听端口"
+
+msgid "Root directory"
+msgstr "根目录"
+
+msgid "QuarkDrive directory to expose, not a local mount path."
+msgstr "需要访问的夸克网盘目录，并非本地挂载路径。"
+
+msgid "WebDAV username"
+msgstr "WebDAV 用户名"
+
+msgid "WebDAV password"
+msgstr "WebDAV 密码"
+
+msgid "WebDAV username and password must be specified together."
+msgstr "WebDAV 用户名和密码必须同时填写或同时留空。"
+
+msgid "Leave both username and password empty to disable authentication. This allows anyone who can reach the server to access your files."
+msgstr "用户名和密码同时留空将关闭身份验证，任何能够连接服务的人都可以访问您的文件。"
+
+msgid "Read-only mode"
+msgstr "只读模式"
+
+msgid "Prevent uploads, changes and deletions through WebDAV."
+msgstr "禁止通过 WebDAV 上传、修改和删除文件。"
+
+msgid "Generate directory index"
+msgstr "生成目录索引"
+
+msgid "Delete permanently"
+msgstr "永久删除"
+
+msgid "Delete files permanently instead of moving them to the trash."
+msgstr "直接永久删除文件，而不是移入回收站。"
+
+msgid "Download buffer size (bytes)"
+msgstr "下载缓冲区大小（字节）"
+
+msgid "Upload buffer size (bytes)"
+msgstr "上传缓冲区大小（字节）"
+
+msgid "Directory cache size"
+msgstr "目录缓存容量"
+
+msgid "Directory cache TTL (seconds)"
+msgstr "目录缓存有效期（秒）"
+
+msgid "Cache refresh interval (seconds)"
+msgstr "缓存刷新间隔（秒）"
+
+msgid "Upload completion timeout (seconds)"
+msgstr "上传完成等待时间（秒）"
+
+msgid "Return success after this timeout while the upload continues in the background. Set to 0 to wait indefinitely."
+msgstr "超过此时间后向客户端返回成功，上传仍在后台继续。设为 0 表示一直等待上传完成。"
+
+msgid "URL prefix to strip"
+msgstr "需要移除的 URL 前缀"
+
+msgid "Remove this prefix from incoming request paths when using a reverse proxy."
+msgstr "使用反向代理时，从收到的请求路径中移除此 URL 前缀。"
+
+msgid "Skip same-size uploads"
+msgstr "跳过同大小文件上传"
+
+msgid "Prefer HTTP downloads"
+msgstr "优先使用 HTTP 下载"
+
+msgid "Enable redirects when possible"
+msgstr "允许可用的重定向"
+
+msgid "Enable debug logging"
+msgstr "启用调试日志"
+
+msgid "Debug logs may contain sensitive information. Disable this after troubleshooting."
+msgstr "调试日志可能包含敏感信息，排查完成后请关闭。"
+
+msgid "Collecting data…"
+msgstr "正在获取数据…"
+
+msgid "RUNNING"
+msgstr "运行中"
+
+msgid "NOT RUNNING"
+msgstr "未运行"
+
+msgid "Start"
+msgstr "启动"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Restart"
+msgstr "重启"
+
+msgid "Service operation failed."
+msgstr "服务操作失败。"
+
+msgid "Unable to read service logs."
+msgstr "无法读取服务日志。"
+
+msgid "No service logs yet."
+msgstr "暂无服务日志。"
+
+msgid "Save & Apply before starting or restarting. Start requires Enable to be checked."
+msgstr "启动或重启前请先保存并应用配置，启动服务需要勾选“启用”。"

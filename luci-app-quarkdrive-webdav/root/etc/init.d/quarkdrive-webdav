@@ -1,0 +1,134 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONF="quarkdrive-webdav"
+
+extra_command "log" "Show recent service logs"
+
+log() {
+	/sbin/logread -e "$CONF" -l 100
+}
+
+fail() {
+	logger -t "$CONF" "$1"
+	printf '%s\n' "$1" >&2
+	return 1
+}
+
+append_arg() {
+	local value
+	config_get value config "$2"
+	# Empty or unchanged values use the binary's own defaults.
+	if [ -n "$value" ] && [ "$value" != "${3-}" ]; then
+		procd_append_param command "$1" "$value"
+	fi
+}
+
+append_bool() {
+	local value
+	config_get_bool value config "$2" 0
+	[ "$value" -ne 1 ] || procd_append_param command "$1"
+}
+
+valid_number() {
+	local value
+	config_get value config "$1"
+	[ -n "$value" ] || return 0
+	case "$value" in
+		*[!0-9]*) fail "Invalid numeric option: $1"; return 1 ;;
+	esac
+	if [ "${2-}" = positive ] && ! [ "$value" -gt 0 ] 2>/dev/null; then
+		fail "$1 must be greater than zero"
+		return 1
+	fi
+}
+
+start_service() {
+	local enabled binary_path quark_cookie auth_user auth_password debug
+
+	config_load "$CONF"
+	config_get_bool enabled config enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get binary_path config binary_path "/usr/bin/quarkdrive-webdav"
+	case "$binary_path" in
+		/*) ;;
+		*) fail "Binary path must be absolute"; return 1 ;;
+	esac
+	if [ ! -f "$binary_path" ] || [ ! -x "$binary_path" ]; then
+		fail "Binary is missing or not executable: $binary_path"
+		return 1
+	fi
+
+	config_get quark_cookie config quark_cookie
+	[ -n "$quark_cookie" ] || {
+		fail "QuarkDrive cookie is required"
+		return 1
+	}
+	config_get auth_user config auth_user
+	config_get auth_password config auth_password
+	if { [ -n "$auth_user" ] && [ -z "$auth_password" ]; } ||
+		{ [ -z "$auth_user" ] && [ -n "$auth_password" ]; }; then
+		fail "WebDAV username and password must be specified together"
+		return 1
+	fi
+
+	valid_number port positive || return 1
+	local port
+	config_get port config port
+	if [ -n "$port" ] && ! [ "$port" -le 65535 ] 2>/dev/null; then
+		fail "Listen port must be between 1 and 65535"
+		return 1
+	fi
+	valid_number read_buffer_size positive || return 1
+	valid_number upload_buffer_size positive || return 1
+	valid_number cache_size || return 1
+	valid_number cache_ttl || return 1
+	valid_number refresh_cache_secs_interval positive || return 1
+	valid_number upload_wait_timeout || return 1
+
+	procd_open_instance "$CONF"
+	procd_set_param command "$binary_path"
+	procd_set_param file "/etc/config/$CONF" "$binary_path"
+	# Secrets are passed as environment variables, never shell command text.
+	procd_set_param env QUARK_COOKIE="$quark_cookie" NO_COLOR=1
+	[ -z "$auth_user" ] || procd_append_param env WEBDAV_AUTH_USER="$auth_user"
+	[ -z "$auth_password" ] || procd_append_param env WEBDAV_AUTH_PASSWORD="$auth_password"
+	config_get_bool debug config debug 0
+	if [ "$debug" -eq 1 ]; then
+		procd_append_param env RUST_LOG="quarkdrive_webdav=debug,reqwest=debug"
+	else
+		procd_append_param env RUST_LOG="quarkdrive_webdav=info,reqwest=warn"
+	fi
+
+	append_arg --host host "0.0.0.0"
+	# Upstream declares only the short port option, not --port.
+	append_arg -p port "8080"
+	append_arg --root root "/"
+	append_arg --read-buffer-size read_buffer_size "10485760"
+	append_arg --upload-buffer-size upload_buffer_size "16777216"
+	append_arg --cache-size cache_size "1000"
+	append_arg --cache-ttl cache_ttl "600"
+	append_arg --refresh-cache-secs-interval refresh_cache_secs_interval "300"
+	append_arg --upload-wait-timeout upload_wait_timeout "280"
+	append_arg --strip-prefix strip_prefix
+	append_bool --auto-index auto_index
+	append_bool --no-trash no_trash
+	append_bool --read-only read_only
+	append_bool --skip-upload-same-size skip_upload_same_size
+	append_bool --prefer-http-download prefer_http_download
+	append_bool --redirect redirect
+	append_bool --debug debug
+
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONF"
+}
