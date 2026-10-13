@@ -7,6 +7,9 @@ USE_PROCD=1
 CONF="quarkdrive-webdav"
 
 extra_command "log" "Show recent service logs"
+extra_command "start_now" "Start once without changing UCI enabled"
+extra_command "stop_now" "Stop and wait without changing UCI enabled"
+extra_command "restart_now" "Restart once without changing UCI enabled"
 
 log() {
 	/sbin/logread -e "$CONF" -l 100
@@ -46,18 +49,8 @@ valid_number() {
 	fi
 }
 
-boot() {
-	local enabled
-	config_load "$CONF"
-	config_get_bool enabled config enabled 0
-	[ "$enabled" -eq 1 ] || return 0
-	start "$@"
-}
-
-start_service() {
-	local binary_path quark_cookie auth_user auth_password debug
-	START_RESULT=1
-
+check_config() {
+	local binary_path quark_cookie auth_user auth_password port
 	config_load "$CONF"
 	config_get binary_path config binary_path "/usr/bin/quarkdrive-webdav"
 	case "$binary_path" in
@@ -83,7 +76,6 @@ start_service() {
 	fi
 
 	valid_number port positive || return 1
-	local port
 	config_get port config port
 	if [ -n "$port" ] && ! [ "$port" -le 65535 ] 2>/dev/null; then
 		fail "Listen port must be between 1 and 65535"
@@ -94,6 +86,20 @@ start_service() {
 	valid_number cache_ttl || return 1
 	valid_number refresh_cache_secs_interval positive || return 1
 	valid_number upload_wait_timeout || return 1
+}
+
+start_service() {
+	local enabled binary_path quark_cookie auth_user auth_password debug
+	START_RESULT=0
+	config_load "$CONF"
+	config_get_bool enabled config enabled 0
+	[ "$enabled" -eq 1 ] || [ "$START_NOW" = 1 ] || return 0
+	START_RESULT=1
+	check_config || return 1
+	config_get binary_path config binary_path "/usr/bin/quarkdrive-webdav"
+	config_get quark_cookie config quark_cookie
+	config_get auth_user config auth_user
+	config_get auth_password config auth_password
 
 	procd_open_instance "$CONF"
 	procd_set_param command "$binary_path"
@@ -127,6 +133,7 @@ start_service() {
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
+	procd_set_param term_timeout 5
 	procd_close_instance
 	START_RESULT=0
 }
@@ -137,10 +144,86 @@ service_started() {
 }
 
 reload_service() {
-	# Applying settings must not start a manually stopped service or stop one
-	# just because autostart is disabled.
-	service_running || return 0
-	start
+	local enabled
+	config_load "$CONF"
+	config_get_bool enabled config enabled 0
+	# Reject invalid replacements before interrupting a working service.
+	[ "$enabled" -ne 1 ] || check_config || return 1
+	stop_now || return 1
+	# Even when disabled, register the configuration reload trigger again.
+	start || return 1
+	[ "$enabled" -ne 1 ] || wait_for_running
+}
+
+wait_for_running() {
+	local attempt=0
+	while :; do
+		service_running "$CONF" && return 0
+		[ "$attempt" -lt 8 ] || break
+		sleep 1 || return 1
+		attempt=$((attempt + 1))
+	done
+	fail "QuarkDrive did not start. Check the system log."
+}
+
+start_now() (
+	check_config || return 1
+	# The override is local to this command, including when called by restart.
+	START_NOW=1
+	start || return 1
+	wait_for_running
+)
+
+service_snapshot() {
+	ubus -t 3 call service list '{"name":"quarkdrive-webdav"}'
+}
+
+service_instances() {
+	jsonfilter -e '@["quarkdrive-webdav"].instances.*'
+}
+
+stop_now() {
+	local services instances pids pid pending attempt=0
+	services="$(service_snapshot)" || {
+		fail "Unable to query the service manager."
+		return 1
+	}
+	instances="$(printf '%s\n' "$services" | service_instances)"
+	[ -n "$instances" ] || return 0
+	pids="$(printf '%s\n' "$services" | jsonfilter -e '@["quarkdrive-webdav"].instances.*.pid')"
+	# Remove the instance, retaining the service's configuration reload trigger.
+	stop "$CONF" || {
+		# Treat an instance removed concurrently as an already stopped service.
+		services="$(service_snapshot)" || return 1
+		instances="$(printf '%s\n' "$services" | service_instances)"
+		[ -z "$instances" ] || {
+			fail "Unable to stop QuarkDrive. Check the system log."
+			return 1
+		}
+	}
+	while :; do
+		services="$(service_snapshot)" || {
+			fail "Unable to query the service manager."
+			return 1
+		}
+		instances="$(printf '%s\n' "$services" | service_instances)"
+		pending=0
+		for pid in $pids; do
+			[ ! -d "/proc/$pid" ] || pending=1
+		done
+		[ -z "$instances" ] && [ "$pending" -eq 0 ] && return 0
+		[ "$attempt" -lt 6 ] || break
+		# BusyBox builds may only accept whole seconds. Recheck after the last wait.
+		sleep 1 || return 1
+		attempt=$((attempt + 1))
+	done
+	fail "Unable to stop QuarkDrive completely. Check the system log."
+}
+
+restart_now() {
+	check_config || return 1
+	stop_now || return 1
+	start_now
 }
 
 service_triggers() {

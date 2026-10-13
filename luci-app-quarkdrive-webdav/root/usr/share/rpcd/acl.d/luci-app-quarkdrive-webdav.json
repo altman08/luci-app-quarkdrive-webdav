@@ -14,9 +14,9 @@
 		"write": {
 			"uci": [ "quarkdrive-webdav" ],
 			"file": {
-				"/etc/init.d/quarkdrive-webdav start": [ "exec" ],
-				"/etc/init.d/quarkdrive-webdav stop": [ "exec" ],
-				"/etc/init.d/quarkdrive-webdav restart": [ "exec" ]
+				"/etc/init.d/quarkdrive-webdav start_now": [ "exec" ],
+				"/etc/init.d/quarkdrive-webdav stop_now": [ "exec" ],
+				"/etc/init.d/quarkdrive-webdav restart_now": [ "exec" ]
 			}
 		}
 	}

@@ -6,6 +6,7 @@
 'require poll';
 'require fs';
 'require ui';
+'require dom';
 
 const serviceName = 'quarkdrive-webdav';
 const initPath = '/etc/init.d/' + serviceName;
@@ -13,21 +14,51 @@ const callServiceList = rpc.declare({
 	object: 'service',
 	method: 'list',
 	params: ['name'],
-	expect: { '': {} }
+	expect: { '': {} },
+	reject: true
+});
+const callEnabled = rpc.declare({
+	object: 'uci',
+	method: 'get',
+	params: ['config', 'section', 'option'],
+	expect: { value: '0' },
+	reject: true
 });
 
 function absolutePath(sectionId, value) {
 	return !value || value.charAt(0) === '/' || _('Use an absolute path beginning with /.');
 }
 
+function loadStylesheet() {
+	const id = 'quarkdrive-webdav-view-stylesheet';
+	if (!document.getElementById(id))
+		document.head.appendChild(E('link', {
+			id, rel: 'stylesheet', href: L.resource('view/quarkdrive-webdav.css')
+		}));
+}
+
+function renderRuntimeStatus(enabled, running, pids) {
+	if (!enabled && !running)
+		return [
+			E('span', { 'class': 'label warning' }, _('Not enabled')),
+			E('span', { 'class': 'quarkdrive-webdav-status-meta' }, _('The service is not running'))
+		];
+	return [
+		E('span', { 'class': running ? (enabled ? 'label success' : 'label warning') : 'label' },
+			running ? (enabled ? _('Running') : _('Running (not enabled)')) : _('Stopped')),
+		E('span', { 'class': 'quarkdrive-webdav-status-meta' }, _('PID: %s').format(pids.length ? pids.join(', ') : '-'))
+	];
+}
+
 return view.extend({
 	load() {
+		loadStylesheet();
 		return uci.load(serviceName);
 	},
 
 	render() {
 		let m, s, o;
-		const status = E('strong', {}, _('Collecting data…'));
+		const status = E('div', {}, _('Collecting data…'));
 		const logs = E('textarea', {
 			'class': 'cbi-input-textarea',
 			'readonly': '',
@@ -41,62 +72,74 @@ return view.extend({
 		let statusRequest = 0;
 		const setButtonState = (button, disabled, style) => {
 			button.disabled = !!disabled;
-			button.className = 'btn cbi-button' + (disabled ? '' : ' ' + style);
+			button.className = 'cbi-button ' + style;
 		};
 		const updateButtons = () => {
 			Object.keys(serviceButtons).forEach(action => {
 				const item = serviceButtons[action];
 				const disabled = busy || m.readonly || running === null ||
-					(action === 'start' && running) || (action === 'stop' && !running);
+					(action === 'start' && running) || (action !== 'start' && !running);
 				setButtonState(item.button, disabled, item.style);
 			});
 			setButtonState(openButton, busy || running !== true, 'cbi-button-action');
 		};
-		const refreshStatus = () => {
+		const refreshStatus = force => {
+			if (busy && !force)
+				return Promise.resolve();
 			const request = ++statusRequest;
-			return callServiceList(serviceName).then(result => {
+			// Read saved UCI without reloading the form or using an unsaved checkbox.
+			return Promise.all([
+				callServiceList(serviceName), callEnabled(serviceName, 'config', 'enabled')
+			]).then(([result, enabled]) => {
 				if (request !== statusRequest)
 					return;
 				const instances = (result[serviceName] || {}).instances || {};
-				running = Object.keys(instances).some(key => instances[key].running);
-				status.textContent = running ? _('RUNNING') : _('NOT RUNNING');
-				status.style.color = running ? 'green' : 'red';
+				const active = Object.keys(instances).map(key => instances[key]).filter(instance => instance && instance.running);
+				running = active.length > 0;
+				const pids = active.filter(instance => instance.pid).map(instance => instance.pid);
+				dom.content(status, renderRuntimeStatus(enabled === '1', running, pids));
 			}).catch(() => {
 				if (request !== statusRequest)
 					return;
 				running = null;
-				status.textContent = _('Unable to read service status.');
-				status.style.color = '';
+				dom.content(status, E('span', { 'class': 'label warning' }, _('Unable to read service status.')));
 			}).finally(updateButtons);
 		};
+		const finishOperation = () => refreshStatus(true).finally(() => {
+			busy = false;
+			updateButtons();
+		});
 		const runAction = (action, button) => {
 			if (button.disabled || busy || m.readonly)
 				return Promise.resolve();
 			busy = true;
 			++statusRequest;
 			updateButtons();
-			return fs.exec(initPath, [action]).then(result => {
+			return fs.exec(initPath, [action + '_now']).then(result => {
 				if (result.code !== 0)
-					throw new Error(result.stderr || _('Service operation failed.'));
+					throw new Error(result.stderr || result.stdout || _('Service operation failed.'));
+				const messages = {
+					start: _('QuarkDrive started.'),
+					stop: _('QuarkDrive stopped.'),
+					restart: _('QuarkDrive restarted.')
+				};
+				ui.addNotification(null, E('p', {}, messages[action]), 'info');
 			}).catch(error => {
 				ui.addNotification(null, E('p', {}, error.message));
-			}).finally(() => refreshStatus().finally(() => {
-				busy = false;
-				updateButtons();
-			}));
+			}).finally(finishOperation);
 		};
 		[
-			['start', _('Start'), 'cbi-button-positive'],
-			['stop', _('Stop'), 'cbi-button-negative'],
+			['start', _('Start'), 'cbi-button-apply'],
+			['stop', _('Stop'), 'cbi-button-reset'],
 			['restart', _('Restart'), 'cbi-button-reload']
 		].forEach(item => {
 			const button = E('button', {
-				'class': 'btn cbi-button ' + item[2],
+				'class': 'cbi-button ' + item[2],
 				'type': 'button',
 				'click': ev => runAction(item[0], ev.currentTarget)
 			}, item[1]);
 			serviceButtons[item[0]] = { button: button, style: item[2] };
-			controls.push(button, ' ');
+			controls.push(button);
 		});
 		const openButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
@@ -122,22 +165,32 @@ return view.extend({
 		m = new form.Map(serviceName, _('QuarkDrive'),
 			_('Expose your QuarkDrive files through WebDAV. The backend package is optional; you can deploy a compatible binary yourself.') + '<br />' +
 			_('This backend serves HTTP only. Use a reverse proxy for HTTPS and do not expose an unauthenticated server to the Internet.'));
+		this.saveSettings = (apply, mode) => {
+			if (busy || m.readonly)
+				return Promise.resolve();
+			busy = true;
+			++statusRequest;
+			updateButtons();
+			return m.save().then(() => apply ? ui.changes.apply(mode == '0') : null).finally(finishOperation);
+		};
+		this.resetSettings = () => busy ? Promise.resolve() : m.reset();
 
 		s = m.section(form.NamedSection, 'config', 'quarkdrive_webdav');
+		s.tab('status', _('Status and actions'));
 		s.tab('basic', _('Basic settings'));
 		s.tab('advanced', _('Advanced settings'));
 		s.tab('log', _('Service log'));
 
-		o = s.taboption('basic', form.Flag, 'enabled', _('Start on boot'));
+		o = s.taboption('status', form.Flag, 'enabled', _('Enable'));
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.DummyValue, '_status', _('Service status'));
+		o = s.taboption('status', form.DummyValue, '_status', _('Current status'));
 		o.renderWidget = () => status;
 
-		o = s.taboption('basic', form.DummyValue, '_actions', _('Service control'));
-		o.renderWidget = () => E('div', {}, controls);
-		o.description = _('Save & Apply before starting or restarting.');
+		o = s.taboption('status', form.DummyValue, '_actions', _('Service control'));
+		o.renderWidget = () => E('div', { 'class': 'quarkdrive-webdav-action-group' }, controls);
+		o.description = _('Service actions use applied settings without changing Enable. Save & Apply starts or restarts the service when enabled, and stops it when disabled.');
 
 		o = s.taboption('basic', form.Value, 'binary_path', _('Binary path'));
 		o.default = '/usr/bin/quarkdrive-webdav';
@@ -150,7 +203,7 @@ return view.extend({
 		o.description = _('Copy the complete Cookie header from a logged-in QuarkDrive browser session.');
 		o.validate = function(sectionId, value) {
 			const enabled = this.map.lookupOption('enabled', sectionId)[0].formvalue(sectionId);
-			return enabled !== '1' || !!value || _('A QuarkDrive cookie is required for automatic startup.');
+			return enabled !== '1' || !!value || _('A QuarkDrive cookie is required when the service is enabled.');
 		};
 
 		o = s.taboption('basic', form.Value, 'host', _('Listen address'));
@@ -207,7 +260,8 @@ return view.extend({
 
 		return m.render().then(map => {
 			updateButtons();
-			poll.add(() => Promise.all([
+			document.addEventListener('uci-applied', () => refreshStatus(true));
+			poll.add(() => busy ? Promise.resolve() : Promise.all([
 				refreshStatus(),
 				fs.exec(initPath, ['log']).then(result => {
 					if (result.code !== 0)
@@ -224,5 +278,9 @@ return view.extend({
 
 			return refreshStatus().then(() => map);
 		});
-	}
+	},
+
+	handleSave() { return this.saveSettings(false); },
+	handleSaveApply(ev, mode) { return this.saveSettings(true, mode); },
+	handleReset() { return this.resetSettings(); }
 });

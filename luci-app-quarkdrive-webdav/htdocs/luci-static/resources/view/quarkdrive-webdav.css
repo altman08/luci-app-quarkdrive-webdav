@@ -1,0 +1,10 @@
+.quarkdrive-webdav-status-meta {
+	margin-left: 1em;
+}
+
+.quarkdrive-webdav-action-group {
+	display: flex;
+	gap: .5em;
+	flex-wrap: wrap;
+	align-items: center;
+}
