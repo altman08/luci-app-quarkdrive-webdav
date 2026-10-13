@@ -133,7 +133,7 @@ test('manual start, restart and stop use temporary commands and preserve unsaved
 	assert.equal(env.renders, 1);
 	assert.equal(env.saves, 0);
 	assert.equal(env.status()[0].children, 'Not enabled');
-	assert.equal(env.notices.length, 3);
+	assert.equal(env.notices.length, 0);
 });
 
 test('unsaved checkbox changes do not affect the status, while applied settings are refreshed', async () => {

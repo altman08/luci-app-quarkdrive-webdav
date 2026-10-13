@@ -166,12 +166,3 @@ msgstr "暂无服务日志。"
 
 msgid "Service actions use applied settings without changing Enable. Save & Apply starts or restarts the service when enabled, and stops it when disabled."
 msgstr "服务操作使用已应用的配置，不改变启用开关。“保存并应用”在启用时启动或重启服务，在未启用时停止服务。"
-
-msgid "QuarkDrive started."
-msgstr "夸克网盘服务已启动。"
-
-msgid "QuarkDrive stopped."
-msgstr "夸克网盘服务已停止。"
-
-msgid "QuarkDrive restarted."
-msgstr "夸克网盘服务已重启。"

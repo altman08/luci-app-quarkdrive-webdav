@@ -118,12 +118,6 @@ return view.extend({
 			return fs.exec(initPath, [action + '_now']).then(result => {
 				if (result.code !== 0)
 					throw new Error(result.stderr || result.stdout || _('Service operation failed.'));
-				const messages = {
-					start: _('QuarkDrive started.'),
-					stop: _('QuarkDrive stopped.'),
-					restart: _('QuarkDrive restarted.')
-				};
-				ui.addNotification(null, E('p', {}, messages[action]), 'info');
 			}).catch(error => {
 				ui.addNotification(null, E('p', {}, error.message));
 			}).finally(finishOperation);
