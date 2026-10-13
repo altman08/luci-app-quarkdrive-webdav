@@ -44,7 +44,7 @@ function renderRuntimeStatus(enabled, running, pids) {
 			E('span', { 'class': 'quarkdrive-webdav-status-meta' }, _('The service is not running'))
 		];
 	return [
-		E('span', { 'class': running ? (enabled ? 'label success' : 'label warning') : 'label' },
+		E('span', { 'class': running ? 'label success' : 'label' },
 			running ? (enabled ? _('Running') : _('Running (not enabled)')) : _('Stopped')),
 		E('span', { 'class': 'quarkdrive-webdav-status-meta' }, _('PID: %s').format(pids.length ? pids.join(', ') : '-'))
 	];

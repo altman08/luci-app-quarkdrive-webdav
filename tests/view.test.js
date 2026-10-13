@@ -101,7 +101,7 @@ for (const [enabled, running, label, style] of [
 	['0', false, 'Not enabled', 'label warning'],
 	['1', false, 'Stopped', 'label'],
 	['1', true, 'Running', 'label success'],
-	['0', true, 'Running (not enabled)', 'label warning']
+	['0', true, 'Running (not enabled)', 'label success']
 ]) {
 	test(`state enabled=${enabled}, running=${running} has the correct label and controls`, async () => {
 		const env = await setup({ enabled, running });
