@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-quarkdrive-webdav
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=2
+PKG_RELEASE:=4
 PKG_LICENSE:=Apache-2.0
 
 LUCI_TITLE:=LuCI support for QuarkDrive

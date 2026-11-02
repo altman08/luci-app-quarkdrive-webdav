@@ -1,0 +1,1925 @@
+From: The PonWrt Authors
+Subject: [PATCH] tls: add AN7581 EIP93 AES-GCM rustls provider
+
+Use cryptodev with verified EIP93 selection, then AF_ALG, then ring software.
+Keep TLS framing, authentication failures and cipher negotiation compatible
+with rustls 0.23.27. Restrict activation to AN7581/EN7581 without CPU AES.
+Reuse per-key record and transport buffers; clear only each record's used
+region. Both kernel interfaces share an 8192-byte plaintext threshold.
+Device detection and backend selection are automatic in the server.
+QUARK_EIP93=auto|devcrypto|afalg|off remains a direct-run diagnostic override.
+
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -11,6 +11,10 @@
+ readme = "README.md"
+ 
+ [dependencies]
++rustls = { version = "=0.23.27", default-features = false, features = ["std", "ring", "tls12"] }
++ring = "=0.17.14"
++libc = "0.2"
++zeroize = "1"
+ #quick-xml = { version = "0.38.0", features = ["serde","serialize"] }
+ md5 = "0.7.0"
+ sha1 = "0.10.0"
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1336,6 +1336,7 @@
+  "htmlescape",
+  "hyper",
+  "hyper-util",
++ "libc",
+  "md5",
+  "moka",
+  "num_cpus",
+@@ -1343,6 +1344,8 @@
+  "reqwest",
+  "reqwest-middleware",
+  "reqwest-retry",
++ "ring",
++ "rustls",
+  "rustls-pemfile",
+  "serde",
+  "serde_json",
+@@ -1353,6 +1356,7 @@
+  "tracing",
+  "tracing-subscriber",
+  "url",
++ "zeroize",
+ ]
+ 
+ [[package]]
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -19,6 +19,7 @@
+ use webdav::WebDavServer;
+ 
+ mod cache;
++mod eip93;
+ mod drive;
+ mod vfs;
+ mod webdav;
+@@ -181,6 +182,7 @@
+         (None, None) => None,
+         _ => bail!("tls-cert and tls-key must be specified together."),
+     };
++    eip93::install()?;
+     let drive = QuarkDrive::new(drive_config)?;
+     let mut fs = QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
+     fs.set_no_trash(opt.no_trash)
+--- a/src/eip93/LICENSE.rustls
++++ b/src/eip93/LICENSE.rustls
+@@ -0,0 +1,25 @@
++Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
++
++Permission is hereby granted, free of charge, to any
++person obtaining a copy of this software and associated
++documentation files (the "Software"), to deal in the
++Software without restriction, including without
++limitation the rights to use, copy, modify, merge,
++publish, distribute, sublicense, and/or sell copies of
++the Software, and to permit persons to whom the Software
++is furnished to do so, subject to the following
++conditions:
++
++The above copyright notice and this permission notice
++shall be included in all copies or substantial portions
++of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
++ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
++TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
++PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
++SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
++IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++DEALINGS IN THE SOFTWARE.
+--- a/src/eip93/LICENSE.xray
++++ b/src/eip93/LICENSE.xray
+@@ -0,0 +1,25 @@
++Copyright 2026 coolsnowwolf
++Copyright 2026 The PonWrt Authors.
++
++Redistribution and use in source and binary forms, with or without modification,
++are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software without
++   specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
++ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
++(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
++ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+--- a/src/eip93/linux.rs
++++ b/src/eip93/linux.rs
+@@ -0,0 +1,572 @@
++// Copyright 2026 The PonWrt Authors.
++// SPDX-License-Identifier: BSD-3-Clause
++// Linux cryptodev 1.14 UAPI and AF_ALG AEAD transport, little-endian 64-bit ABI.
++// Reference: xray-core patches 190/192, BSD-3-Clause, PonWrt Authors / coolsnowwolf.
++use super::{Backend, MAX, TAG, Transport, output_len, wipe};
++use std::{
++    io,
++    mem::{size_of, zeroed},
++    os::fd::{AsRawFd, FromRawFd, OwnedFd},
++    ptr,
++    sync::atomic::{AtomicUsize, Ordering},
++};
++use zeroize::Zeroizing;
++
++const SOL_ALG: i32 = 279;
++const ALG: &str = "gcm_base(ctr(aes-eip93),ghash-generic)";
++const LIMIT: usize = 128;
++static SESSIONS: AtomicUsize = AtomicUsize::new(0);
++struct Lease(&'static AtomicUsize);
++impl Lease {
++    fn acquire() -> io::Result<Self> {
++        Self::acquire_from(&SESSIONS)
++    }
++    fn acquire_from(counter: &'static AtomicUsize) -> io::Result<Self> {
++        counter
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++                (n < LIMIT).then_some(n + 1)
++            })
++            .map(|_| Self(counter))
++            .map_err(|_| io::Error::from_raw_os_error(libc::EMFILE))
++    }
++}
++impl Drop for Lease {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::Relaxed);
++    }
++}
++
++pub(super) fn open(backend: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++    if key.len() != 16 && key.len() != 32 {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    match backend {
++        Backend::Devcrypto => Ok(Box::new(Devcrypto::open(key)?)),
++        Backend::Afalg => Ok(Box::new(Afalg::open(key, ALG)?)),
++        _ => Err(io::ErrorKind::InvalidInput.into()),
++    }
++}
++fn cvt(n: i32) -> io::Result<i32> {
++    if n < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(n)
++    }
++}
++fn owned(n: i32) -> io::Result<OwnedFd> {
++    // SAFETY: a successful syscall returns a newly owned file descriptor.
++    Ok(unsafe { OwnedFd::from_raw_fd(cvt(n)?) })
++}
++type Call = fn(&OwnedFd, libc::c_ulong, *mut libc::c_void) -> io::Result<()>;
++fn ioctl(fd: &OwnedFd, request: libc::c_ulong, data: *mut libc::c_void) -> io::Result<()> {
++    // SAFETY: requests below match the repr(C) UAPI structure passed by callers.
++    // musl takes c_int; glibc takes c_ulong. Preserve the ioctl bit pattern.
++    cvt(unsafe { libc::ioctl(fd.as_raw_fd(), request as _, data) }).map(|_| ())
++}
++
++#[repr(C)]
++#[derive(Default)]
++struct SessionOp {
++    cipher: u32,
++    mac: u32,
++    key_len: u32,
++    key: *const u8,
++    mac_key_len: u32,
++    mac_key: *const u8,
++    session: u32,
++}
++#[repr(C)]
++struct AlgorithmInfo {
++    name: [u8; 64],
++    driver: [u8; 64],
++}
++#[repr(C)]
++struct SessionInfo {
++    session: u32,
++    cipher: AlgorithmInfo,
++    hash: AlgorithmInfo,
++    align_mask: u16,
++    flags: u32,
++}
++#[repr(C)]
++#[derive(Default)]
++struct AuthOp {
++    session: u32,
++    op: u16,
++    flags: u16,
++    len: u32,
++    auth_len: u32,
++    auth_src: *const u8,
++    src: *const u8,
++    dst: *mut u8,
++    tag: *mut u8,
++    tag_len: u32,
++    iv: *const u8,
++    iv_len: u32,
++}
++const GET_SESSION: libc::c_ulong = 0xc0306366;
++const END_SESSION: libc::c_ulong = 0x40046367;
++const GET_INFO: libc::c_ulong = 0xc10c636b;
++const AUTH_CRYPT: libc::c_ulong = 0xc048636d;
++const _: () = {
++    assert!(size_of::<SessionOp>() == 48);
++    assert!(size_of::<SessionInfo>() == 268);
++    assert!(size_of::<AuthOp>() == 72);
++};
++
++struct Aligned {
++    bytes: Zeroizing<Vec<u8>>,
++    start: usize,
++    len: usize,
++}
++impl Aligned {
++    fn new(len: usize, mask: u16) -> Self {
++        let bytes = Zeroizing::new(vec![0; len + usize::from(mask)]);
++        let start = (bytes.as_ptr() as usize).wrapping_neg() & usize::from(mask);
++        Self { bytes, start, len }
++    }
++    fn data(&mut self) -> &mut [u8] {
++        &mut self.bytes[self.start..self.start + self.len]
++    }
++    fn clear(&mut self, used: usize) {
++        wipe(&mut self.data()[..used]);
++    }
++}
++struct SessionFd {
++    fd: OwnedFd,
++    id: Option<u32>,
++    call: Call,
++}
++impl SessionFd {
++    fn request<T>(&self, request: libc::c_ulong, data: &mut T) -> io::Result<()> {
++        (self.call)(&self.fd, request, (data as *mut T).cast())
++    }
++}
++impl Drop for SessionFd {
++    fn drop(&mut self) {
++        if let Some(mut id) = self.id {
++            let _ = self.request(END_SESSION, &mut id);
++        }
++    }
++}
++struct Devcrypto {
++    session: SessionFd,
++    buffer: Aligned,
++    aad: Aligned,
++    iv: Aligned,
++    _lease: Lease,
++}
++fn driver_matches(info: &SessionInfo) -> bool {
++    fn name(bytes: &[u8]) -> &[u8] {
++        &bytes[..bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len())]
++    }
++    name(&info.cipher.name) == b"gcm(aes)" && name(&info.cipher.driver) == ALG.as_bytes()
++}
++impl Devcrypto {
++    fn open(key: &[u8]) -> io::Result<Self> {
++        Self::open_with(key, c"/dev/crypto", ioctl)
++    }
++    fn open_with(key: &[u8], path: &std::ffi::CStr, call: Call) -> io::Result<Self> {
++        let lease = Lease::acquire()?;
++        // SAFETY: static NUL-terminated pathname; no mode argument needed without O_CREAT.
++        let fd = owned(unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) })?;
++        let mut session = SessionFd { fd, id: None, call };
++        let mut op = SessionOp {
++            cipher: 50,
++            key_len: key.len() as u32,
++            key: key.as_ptr(),
++            ..Default::default()
++        };
++        session.request(GET_SESSION, &mut op)?;
++        session.id = Some(op.session);
++        // SAFETY: SessionInfo contains only integer/byte fields; all-zero is valid.
++        let mut info: SessionInfo = unsafe { zeroed() };
++        info.session = op.session;
++        session.request(GET_INFO, &mut info)?;
++        if !driver_matches(&info) {
++            return Err(io::Error::other(
++                "cryptodev did not select the EIP93 GCM driver",
++            ));
++        }
++        let mask = info.align_mask;
++        if u32::from(mask) & (u32::from(mask) + 1) != 0 {
++            return Err(io::Error::other("invalid cryptodev alignmask"));
++        }
++        Ok(Self {
++            session,
++            buffer: Aligned::new(MAX + TAG, mask),
++            aad: Aligned::new(256, mask),
++            iv: Aligned::new(16, mask),
++            _lease: lease,
++        })
++    }
++}
++impl Transport for Devcrypto {
++    fn exchange_into(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++        dst: &mut [u8],
++    ) -> io::Result<usize> {
++        let expected = output_len(src, aad, decrypt, dst)?;
++        self.buffer.data()[..src.len()].copy_from_slice(src);
++        self.aad.data()[..aad.len()].copy_from_slice(aad);
++        self.iv.data()[..12].copy_from_slice(nonce);
++        let mut req = AuthOp {
++            session: self.session.id.unwrap(),
++            op: u16::from(decrypt),
++            len: src.len() as u32,
++            auth_len: aad.len() as u32,
++            auth_src: self.aad.data().as_ptr(),
++            src: self.buffer.data().as_ptr(),
++            dst: self.buffer.data().as_mut_ptr(),
++            tag_len: TAG as u32,
++            iv: self.iv.data().as_ptr(),
++            iv_len: 12,
++            ..Default::default()
++        };
++        let result = self.session.request(AUTH_CRYPT, &mut req).and_then(|_| {
++            if req.len as usize != expected {
++                return Err(io::Error::other("short cryptodev output"));
++            }
++            dst[..expected].copy_from_slice(&self.buffer.data()[..expected]);
++            Ok(expected)
++        });
++        self.buffer.clear(src.len().max(expected));
++        self.aad.clear(aad.len());
++        self.iv.clear(12);
++        result
++    }
++}
++struct Afalg {
++    fd: OwnedFd,
++    input: Zeroizing<Vec<u8>>,
++    output: Zeroizing<Vec<u8>>,
++    control: [usize; 16],
++    _lease: Lease,
++}
++impl Afalg {
++    fn open(key: &[u8], algorithm: &str) -> io::Result<Self> {
++        let lease = Lease::acquire()?;
++        if algorithm.len() >= 64 {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
++        // SAFETY: all syscall argument buffers below have their UAPI sizes and lifetimes.
++        unsafe {
++            let tfm = owned(libc::socket(
++                libc::AF_ALG,
++                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
++                0,
++            ))?;
++            let mut addr: libc::sockaddr_alg = zeroed();
++            addr.salg_family = libc::AF_ALG as u16;
++            addr.salg_type[..4].copy_from_slice(b"aead");
++            addr.salg_name[..algorithm.len()].copy_from_slice(algorithm.as_bytes());
++            cvt(libc::bind(
++                tfm.as_raw_fd(),
++                &addr as *const _ as *const libc::sockaddr,
++                size_of::<libc::sockaddr_alg>() as libc::socklen_t,
++            ))?;
++            cvt(libc::setsockopt(
++                tfm.as_raw_fd(),
++                SOL_ALG,
++                1,
++                key.as_ptr().cast(),
++                key.len() as libc::socklen_t,
++            ))?;
++            // ALG_SET_AEAD_AUTHSIZE uses optlen, not optval, for the tag size.
++            cvt(libc::setsockopt(
++                tfm.as_raw_fd(),
++                SOL_ALG,
++                5,
++                ptr::null(),
++                TAG as libc::socklen_t,
++            ))?;
++            let fd = owned(libc::accept4(
++                tfm.as_raw_fd(),
++                ptr::null_mut(),
++                ptr::null_mut(),
++                libc::SOCK_CLOEXEC,
++            ))?;
++            let timeout = libc::timeval {
++                tv_sec: 1,
++                tv_usec: 0,
++            };
++            for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
++                cvt(libc::setsockopt(
++                    fd.as_raw_fd(),
++                    libc::SOL_SOCKET,
++                    option,
++                    &timeout as *const _ as *const libc::c_void,
++                    size_of::<libc::timeval>() as libc::socklen_t,
++                ))?;
++            }
++            Ok(Self {
++                fd,
++                input: Zeroizing::new(vec![0; MAX + TAG + 256]),
++                output: Zeroizing::new(vec![0; MAX + TAG + 256]),
++                control: [0; 16],
++                _lease: lease,
++            })
++        }
++    }
++}
++// Word-aligned control storage is required by CMSG_FIRSTHDR/CMSG_NXTHDR.
++fn cmsg(storage: &mut [usize], used: &mut usize, kind: i32, data: &[u8]) {
++    // SAFETY: callers provide enough word-aligned storage for all control messages.
++    unsafe {
++        let space = libc::CMSG_SPACE(data.len() as u32) as usize;
++        assert!(*used + space <= std::mem::size_of_val(storage));
++        let header = storage
++            .as_mut_ptr()
++            .cast::<u8>()
++            .add(*used)
++            .cast::<libc::cmsghdr>();
++        (*header).cmsg_level = SOL_ALG;
++        (*header).cmsg_type = kind;
++        // These length fields are socklen_t on musl and size_t on glibc.
++        (*header).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
++        ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(header), data.len());
++        *used += space;
++    }
++}
++impl Transport for Afalg {
++    fn exchange_into(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++        dst: &mut [u8],
++    ) -> io::Result<usize> {
++        let expected = output_len(src, aad, decrypt, dst)?;
++        let input = &mut self.input[..aad.len() + src.len()];
++        input[..aad.len()].copy_from_slice(aad);
++        input[aad.len()..].copy_from_slice(src);
++        let output = &mut self.output[..aad.len() + expected];
++        let result = (|| {
++            let control = &mut self.control;
++            let mut used = 0;
++            cmsg(control, &mut used, 3, &u32::from(!decrypt).to_ne_bytes());
++            let mut iv = [0u8; 16];
++            iv[..4].copy_from_slice(&12u32.to_ne_bytes());
++            iv[4..].copy_from_slice(nonce);
++            cmsg(control, &mut used, 2, &iv);
++            cmsg(control, &mut used, 4, &(aad.len() as u32).to_ne_bytes());
++            // SAFETY: msghdr/iovec point at live, sized buffers until the synchronous syscalls return.
++            unsafe {
++                let mut iov = libc::iovec {
++                    iov_base: input.as_mut_ptr().cast(),
++                    iov_len: input.len(),
++                };
++                let mut msg: libc::msghdr = zeroed();
++                msg.msg_iov = &mut iov;
++                msg.msg_iovlen = 1;
++                msg.msg_control = control.as_mut_ptr().cast();
++                msg.msg_controllen = used as _;
++                let sent = libc::sendmsg(self.fd.as_raw_fd(), &msg, 0);
++                if sent < 0 {
++                    return Err(io::Error::last_os_error());
++                }
++                if sent as usize != input.len() {
++                    return Err(io::Error::other("short AF_ALG send"));
++                }
++                let read = libc::read(
++                    self.fd.as_raw_fd(),
++                    output.as_mut_ptr().cast(),
++                    output.len(),
++                );
++                if read < 0 {
++                    return Err(io::Error::last_os_error());
++                }
++                if read as usize != output.len() {
++                    return Err(io::Error::other("short AF_ALG read"));
++                }
++            }
++            dst[..expected].copy_from_slice(&output[aad.len()..]);
++            Ok(expected)
++        })();
++        wipe(input);
++        wipe(output);
++        result
++    }
++}
++
++#[cfg(test)]
++pub(super) fn open_generic(backend: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++    if backend != Backend::Afalg {
++        return Err(io::Error::from_raw_os_error(libc::ENOENT));
++    }
++    Ok(Box::new(Afalg::open(
++        key,
++        "gcm_base(ctr(aes-generic),ghash-generic)",
++    )?))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn uapi_layout() {
++        // Independent cryptodev 1.14 C UAPI sizes, offsets and _IO* request values.
++        assert_eq!(std::mem::offset_of!(SessionOp, key), 16);
++        assert_eq!(std::mem::offset_of!(SessionOp, session), 40);
++        assert_eq!(std::mem::offset_of!(SessionInfo, align_mask), 260);
++        assert_eq!(std::mem::offset_of!(SessionInfo, flags), 264);
++        assert_eq!(std::mem::offset_of!(AuthOp, src), 24);
++        assert_eq!(std::mem::offset_of!(AuthOp, iv), 56);
++        assert_eq!(
++            GET_SESSION,
++            (3 << 30) | (48 << 16) | (b'c' as u64) << 8 | 102
++        );
++        assert_eq!(
++            AUTH_CRYPT,
++            (3 << 30) | (72 << 16) | (b'c' as u64) << 8 | 109
++        );
++        for mask in [0, 3, 15, 63, 4095, 65535] {
++            let mut data = Aligned::new(MAX + TAG, mask);
++            assert_eq!(data.data().as_ptr() as usize & usize::from(mask), 0);
++        }
++    }
++    #[test]
++    fn driver_selection() {
++        let mut info: SessionInfo = unsafe { zeroed() };
++        info.cipher.name[..8].copy_from_slice(b"gcm(aes)");
++        info.cipher.driver[..ALG.len()].copy_from_slice(ALG.as_bytes());
++        assert!(driver_matches(&info));
++        info.cipher.driver[0] ^= 1;
++        assert!(!driver_matches(&info));
++    }
++    #[test]
++    fn session_limit_and_cleanup() {
++        static COUNTER: AtomicUsize = AtomicUsize::new(0);
++        let mut leases = Vec::new();
++        while let Ok(lease) = Lease::acquire_from(&COUNTER) {
++            leases.push(lease);
++        }
++        assert!(
++            matches!(Lease::acquire_from(&COUNTER), Err(e) if e.raw_os_error() == Some(libc::EMFILE))
++        );
++        drop(leases);
++        assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
++        assert!(Afalg::open(&[0; 16], "nonexistent-quark-eip93-test").is_err());
++        // A failed production open also drops its lease via RAII.
++    }
++}
++
++#[cfg(test)]
++mod devcrypto_tests {
++    use super::*;
++    use std::{cell::Cell, slice};
++    thread_local! { static CLOSED: Cell<usize> = const { Cell::new(0) }; }
++    fn model(_: &OwnedFd, request: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
++        // A cryptodev 1.14 UAPI model with an independent ring AES-GCM oracle.
++        // It validates ioctl framing; it is not an EIP93 hardware test.
++        unsafe {
++            match request {
++                GET_SESSION => {
++                    let op = &mut *arg.cast::<SessionOp>();
++                    assert_eq!(op.cipher, 50);
++                    assert_eq!(op.mac, 0);
++                    assert!(matches!(op.key_len, 16 | 32));
++                    assert!(
++                        slice::from_raw_parts(op.key, op.key_len as usize)
++                            .iter()
++                            .all(|b| *b == 7)
++                    );
++                    op.session = 41;
++                }
++                GET_INFO => {
++                    let info = &mut *arg.cast::<SessionInfo>();
++                    assert_eq!(info.session, 41);
++                    info.cipher.name[..8].copy_from_slice(b"gcm(aes)");
++                    info.cipher.driver[..ALG.len()].copy_from_slice(ALG.as_bytes());
++                    info.align_mask = 15;
++                }
++                AUTH_CRYPT => {
++                    let op = &mut *arg.cast::<AuthOp>();
++                    assert_eq!(op.session, 41);
++                    assert_eq!(op.flags, 0);
++                    assert_eq!(op.src, op.dst);
++                    assert!(op.tag.is_null());
++                    assert_eq!(op.tag_len, 16);
++                    assert_eq!(op.iv_len, 12);
++                    assert_eq!(op.src as usize & 15, 0);
++                    assert_eq!(op.iv as usize & 15, 0);
++                    let nonce = &*op.iv.cast::<[u8; 12]>();
++                    let src = slice::from_raw_parts(op.src, op.len as usize);
++                    let aad = slice::from_raw_parts(op.auth_src, op.auth_len as usize);
++                    let mut oracle = super::super::tests::software(&[7; 32]);
++                    let out = oracle.exchange(nonce, src, aad, op.op == 1)?;
++                    ptr::copy_nonoverlapping(out.as_ptr(), op.dst, out.len());
++                    op.len = out.len() as u32;
++                }
++                END_SESSION => {
++                    assert_eq!(*arg.cast::<u32>(), 41);
++                    CLOSED.with(|n| n.set(n.get() + 1));
++                }
++                _ => return Err(io::Error::from_raw_os_error(libc::ENOTTY)),
++            }
++        }
++        Ok(())
++    }
++    fn bad_driver(fd: &OwnedFd, req: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
++        model(fd, req, arg)?;
++        if req == GET_INFO {
++            unsafe {
++                (*arg.cast::<SessionInfo>()).cipher.driver[0] = b'x';
++            }
++        }
++        Ok(())
++    }
++    fn auth_error(fd: &OwnedFd, req: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
++        if req == AUTH_CRYPT {
++            unsafe {
++                *(*arg.cast::<AuthOp>()).dst = 0xee;
++            }
++            return Err(io::Error::from_raw_os_error(libc::EBADMSG));
++        }
++        model(fd, req, arg)
++    }
++    fn short_output(fd: &OwnedFd, req: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
++        model(fd, req, arg)?;
++        if req == AUTH_CRYPT {
++            unsafe {
++                (*arg.cast::<AuthOp>()).len -= 1;
++            }
++        }
++        Ok(())
++    }
++    #[test]
++    fn cryptodev_marshalling_authentication_and_cleanup() {
++        CLOSED.with(|n| n.set(0));
++        let mut t = Devcrypto::open_with(&[7; 32], c"/dev/null", model).unwrap();
++        super::super::selftest(&mut t, &[7; 32]).unwrap();
++        let input = vec![29; 16384];
++        let allocation = t.buffer.data().as_ptr();
++        for n in [16384, 8192, MAX, 8193, 8192] {
++            let input = vec![29; n];
++            let encrypted = t.exchange(&[19; 12], &input, b"aad", false).unwrap();
++            let plain = t.exchange(&[19; 12], &encrypted, b"aad", true).unwrap();
++            assert_eq!(*plain, input);
++            assert!(t.buffer.data().iter().all(|b| *b == 0));
++            assert_eq!(t.buffer.data().as_ptr(), allocation);
++            assert!(t.aad.data().iter().all(|b| *b == 0));
++            assert!(t.iv.data().iter().all(|b| *b == 0));
++        }
++        drop(t);
++        assert!(Devcrypto::open_with(&[7; 32], c"/dev/null", bad_driver).is_err());
++        let mut t = Devcrypto::open_with(&[7; 32], c"/dev/null", auth_error).unwrap();
++        let err = t.exchange(&[19; 12], &input, b"aad", true).unwrap_err();
++        assert_eq!(err.raw_os_error(), Some(libc::EBADMSG));
++        assert_eq!(input, vec![29; 16384]);
++        assert!(t.buffer.data().iter().all(|b| *b == 0));
++        drop(t);
++        let mut t = Devcrypto::open_with(&[7; 32], c"/dev/null", short_output).unwrap();
++        assert!(t.exchange(&[19; 12], &input, b"aad", false).is_err());
++        drop(t);
++        CLOSED.with(|n| assert_eq!(n.get(), 4));
++    }
++}
+--- a/src/eip93/mod.rs
++++ b/src/eip93/mod.rs
+@@ -0,0 +1,622 @@
++// Copyright 2026 The PonWrt Authors.
++// SPDX-License-Identifier: MIT
++// TLS framing follows rustls 0.23.27 (MIT OR Apache-2.0 OR ISC).
++// Only AES-GCM record protection is replaced; ring supplies the rest of TLS.
++use ring::{
++    aead,
++    rand::{SecureRandom, SystemRandom},
++};
++use rustls::crypto::cipher::{
++    AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, KeyBlockShape, MessageDecrypter,
++    MessageEncrypter, Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
++    Tls12AeadAlgorithm, Tls13AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
++    make_tls13_aad,
++};
++use rustls::crypto::{CipherSuiteCommon, CryptoProvider};
++use rustls::{
++    CipherSuite, ConnectionTrafficSecrets, ContentType, Error, ProtocolVersion,
++    SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite,
++};
++use std::{io, sync::Once};
++use zeroize::{Zeroize, Zeroizing};
++
++#[cfg(all(
++    target_os = "linux",
++    target_pointer_width = "64",
++    target_endian = "little",
++    any(target_arch = "aarch64", target_arch = "x86_64")
++))]
++mod linux;
++#[cfg(test)]
++mod tests;
++
++const MIN: usize = 8192;
++const MAX: usize = 32768;
++const TAG: usize = 16;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Backend {
++    Auto,
++    Devcrypto,
++    Afalg,
++    Off,
++}
++impl Backend {
++    fn parse(value: &str) -> Self {
++        match value {
++            "" | "auto" => Self::Auto,
++            "devcrypto" => Self::Devcrypto,
++            "afalg" => Self::Afalg,
++            "off" => Self::Off,
++            _ => {
++                tracing::warn!("Unknown QUARK_EIP93 value; acceleration disabled");
++                Self::Off
++            }
++        }
++    }
++}
++
++// exchange_into keeps input untouched and copies output only after authentication.
++trait Transport: Send + Sync {
++    fn exchange_into(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++        dst: &mut [u8],
++    ) -> io::Result<usize>;
++    #[cfg(test)]
++    fn exchange(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++    ) -> io::Result<Zeroizing<Vec<u8>>> {
++        let mut out = Zeroizing::new(vec![0; src.len() + TAG]);
++        let n = self.exchange_into(nonce, src, aad, decrypt, &mut out)?;
++        out[n..].zeroize();
++        out.truncate(n);
++        Ok(out)
++    }
++}
++// Reuse live buffers, clearing only bytes used by this record. Zeroizing also
++// clears their full allocation when the key/session is released.
++#[inline(never)]
++fn wipe(bytes: &mut [u8]) {
++    bytes.fill(0);
++    std::hint::black_box(bytes);
++}
++fn output_len(src: &[u8], aad: &[u8], decrypt: bool, dst: &[u8]) -> io::Result<usize> {
++    let n = if decrypt {
++        src.len().checked_sub(TAG)
++    } else {
++        Some(src.len())
++    }
++    .ok_or(io::ErrorKind::InvalidInput)?;
++    let expected = if decrypt { n } else { n + TAG };
++    if n > MAX || aad.len() > 256 || dst.len() < expected {
++        return Err(io::ErrorKind::InvalidInput.into());
++    }
++    Ok(expected)
++}
++struct Record<'a>(&'a mut [u8]);
++impl std::ops::Deref for Record<'_> {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        self.0
++    }
++}
++impl Drop for Record<'_> {
++    fn drop(&mut self) {
++        wipe(self.0);
++    }
++}
++type Open = fn(Backend, &[u8]) -> io::Result<Box<dyn Transport>>;
++#[derive(Clone, Copy)]
++struct Settings {
++    backend: Backend,
++    open: Open,
++}
++
++fn compatible(data: &[u8]) -> bool {
++    if data.last() != Some(&0) {
++        return false;
++    }
++    let mut found = false;
++    for part in data.split(|b| *b == 0) {
++        match part {
++            b"airoha,an7583" | b"airoha,en7583" => return false,
++            b"airoha,an7581" | b"airoha,en7581" => found = true,
++            _ => (),
++        }
++    }
++    found
++}
++
++fn supported_device() -> bool {
++    #[cfg(all(target_os = "linux", target_arch = "aarch64", target_endian = "little"))]
++    {
++        if std::arch::is_aarch64_feature_detected!("aes") {
++            return false;
++        }
++        for path in [
++            "/sys/firmware/devicetree/base/compatible",
++            "/proc/device-tree/compatible",
++        ] {
++            if let Ok(data) = std::fs::read(path) {
++                return compatible(&data);
++            }
++        }
++    }
++    false
++}
++
++fn open(backend: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++    #[cfg(all(
++        target_os = "linux",
++        target_pointer_width = "64",
++        target_endian = "little",
++        any(target_arch = "aarch64", target_arch = "x86_64")
++    ))]
++    {
++        linux::open(backend, key)
++    }
++    #[cfg(not(all(
++        target_os = "linux",
++        target_pointer_width = "64",
++        target_endian = "little",
++        any(target_arch = "aarch64", target_arch = "x86_64")
++    )))]
++    {
++        let _ = (backend, key);
++        Err(io::ErrorKind::Unsupported.into())
++    }
++}
++
++pub fn install() -> anyhow::Result<()> {
++    let backend = Backend::parse(&std::env::var("QUARK_EIP93").unwrap_or_default());
++    if backend == Backend::Off || !supported_device() {
++        return Ok(());
++    }
++    provider(Settings { backend, open })
++        .install_default()
++        .map_err(|_| {
++            anyhow::anyhow!("rustls provider was already installed before EIP93 initialization")
++        })
++}
++
++fn common(c: &CipherSuiteCommon) -> CipherSuiteCommon {
++    CipherSuiteCommon {
++        suite: c.suite,
++        hash_provider: c.hash_provider,
++        confidentiality_limit: c.confidentiality_limit,
++    }
++}
++
++// Called once in production. rustls requires static suite/algorithm references;
++// these six small allocations intentionally live for the process lifetime.
++fn provider(settings: Settings) -> CryptoProvider {
++    let mut p = rustls::crypto::ring::default_provider();
++    p.cipher_suites = p
++        .cipher_suites
++        .iter()
++        .map(|suite| {
++            let key_len = match suite.suite() {
++                CipherSuite::TLS13_AES_128_GCM_SHA256
++                | CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
++                | CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => 16,
++                CipherSuite::TLS13_AES_256_GCM_SHA384
++                | CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
++                | CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => 32,
++                _ => return *suite,
++            };
++            match suite {
++                SupportedCipherSuite::Tls13(s) => {
++                    SupportedCipherSuite::Tls13(Box::leak(Box::new(Tls13CipherSuite {
++                        common: common(&s.common),
++                        hkdf_provider: s.hkdf_provider,
++                        quic: s.quic,
++                        aead_alg: Box::leak(Box::new(Algorithm13 {
++                            inner: s.aead_alg,
++                            settings,
++                            key_len,
++                        })),
++                    })))
++                }
++                SupportedCipherSuite::Tls12(s) => {
++                    SupportedCipherSuite::Tls12(Box::leak(Box::new(Tls12CipherSuite {
++                        common: common(&s.common),
++                        prf_provider: s.prf_provider,
++                        kx: s.kx,
++                        sign: s.sign,
++                        aead_alg: Box::leak(Box::new(Algorithm12 {
++                            inner: s.aead_alg,
++                            settings,
++                        })),
++                    })))
++                }
++            }
++        })
++        .collect();
++    p
++}
++
++struct Algorithm13 {
++    inner: &'static dyn Tls13AeadAlgorithm,
++    settings: Settings,
++    key_len: usize,
++}
++impl Tls13AeadAlgorithm for Algorithm13 {
++    fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
++        let state = State::new(key.as_ref(), self.settings);
++        let offset = Iv::from(<[u8; 12]>::try_from(iv.as_ref()).unwrap());
++        Box::new(Encrypt {
++            software: self.inner.encrypter(key, iv),
++            state,
++            iv: offset,
++            tls13: true,
++            plain: Zeroizing::new(Vec::new()),
++        })
++    }
++    fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
++        let state = State::new(key.as_ref(), self.settings);
++        let offset = Iv::from(<[u8; 12]>::try_from(iv.as_ref()).unwrap());
++        Box::new(Decrypt {
++            software: self.inner.decrypter(key, iv),
++            state,
++            salt: offset,
++            tls13: true,
++        })
++    }
++    fn key_len(&self) -> usize {
++        self.key_len
++    }
++    fn extract_keys(
++        &self,
++        key: AeadKey,
++        iv: Iv,
++    ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
++        self.inner.extract_keys(key, iv)
++    }
++}
++struct Algorithm12 {
++    inner: &'static dyn Tls12AeadAlgorithm,
++    settings: Settings,
++}
++impl Tls12AeadAlgorithm for Algorithm12 {
++    fn encrypter(&self, key: AeadKey, iv: &[u8], explicit: &[u8]) -> Box<dyn MessageEncrypter> {
++        let state = State::new(key.as_ref(), self.settings);
++        let mut offset = [0; 12];
++        offset[..4].copy_from_slice(iv);
++        offset[4..].copy_from_slice(explicit);
++        Box::new(Encrypt {
++            software: self.inner.encrypter(key, iv, explicit),
++            state,
++            iv: Iv::from(offset),
++            tls13: false,
++            plain: Zeroizing::new(Vec::new()),
++        })
++    }
++    fn decrypter(&self, key: AeadKey, iv: &[u8]) -> Box<dyn MessageDecrypter> {
++        let state = State::new(key.as_ref(), self.settings);
++        let mut salt = [0; 12];
++        salt[..4].copy_from_slice(iv);
++        Box::new(Decrypt {
++            software: self.inner.decrypter(key, iv),
++            state,
++            salt: Iv::from(salt),
++            tls13: false,
++        })
++    }
++    fn key_block_shape(&self) -> KeyBlockShape {
++        self.inner.key_block_shape()
++    }
++    fn extract_keys(
++        &self,
++        key: AeadKey,
++        iv: &[u8],
++        explicit: &[u8],
++    ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
++        self.inner.extract_keys(key, iv, explicit)
++    }
++}
++
++struct Encrypt {
++    plain: Zeroizing<Vec<u8>>,
++    software: Box<dyn MessageEncrypter>,
++    state: State,
++    iv: Iv,
++    tls13: bool,
++}
++impl MessageEncrypter for Encrypt {
++    fn encrypt(
++        &mut self,
++        msg: OutboundPlainMessage<'_>,
++        seq: u64,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        let n = msg.payload.len() + usize::from(self.tls13);
++        if !self.state.eligible(n) {
++            return self.software.encrypt(msg, seq);
++        }
++        let nonce = Nonce::new(&self.iv, seq).0;
++        if self.plain.capacity() < MAX {
++            let additional = MAX - self.plain.len();
++            self.plain.reserve_exact(additional);
++        }
++        self.plain.clear();
++        msg.payload.copy_to_vec(&mut self.plain);
++        let mut aad = [0u8; 13];
++        let aad_len = if self.tls13 {
++            self.plain.push(msg.typ.into());
++            aad[..5].copy_from_slice(&make_tls13_aad(n + TAG));
++            5
++        } else {
++            aad.copy_from_slice(&make_tls12_aad(seq, msg.typ, msg.version, n));
++            13
++        };
++        let result = self
++            .state
++            .crypt_record(&nonce, &self.plain, &aad[..aad_len], false);
++        wipe(&mut self.plain);
++        self.plain.clear();
++        match result {
++            Some(Ok(out)) => {
++                let mut payload =
++                    PrefixedPayload::with_capacity(out.len() + if self.tls13 { 0 } else { 8 });
++                if !self.tls13 {
++                    payload.extend_from_slice(&nonce[4..]);
++                }
++                payload.extend_from_slice(&out);
++                Ok(OutboundOpaqueMessage::new(
++                    if self.tls13 {
++                        ContentType::ApplicationData
++                    } else {
++                        msg.typ
++                    },
++                    if self.tls13 {
++                        ProtocolVersion::TLSv1_2
++                    } else {
++                        msg.version
++                    },
++                    payload,
++                ))
++            }
++            Some(Err(_)) => Err(Error::EncryptError),
++            None => self.software.encrypt(msg, seq),
++        }
++    }
++    fn encrypted_payload_len(&self, n: usize) -> usize {
++        self.software.encrypted_payload_len(n)
++    }
++}
++struct Decrypt {
++    software: Box<dyn MessageDecrypter>,
++    state: State,
++    salt: Iv,
++    tls13: bool,
++}
++impl MessageDecrypter for Decrypt {
++    fn decrypt<'a>(
++        &mut self,
++        mut msg: InboundOpaqueMessage<'a>,
++        seq: u64,
++    ) -> Result<InboundPlainMessage<'a>, Error> {
++        let prefix = if self.tls13 { 0 } else { 8 };
++        let Some(n) = msg.payload.len().checked_sub(prefix + TAG) else {
++            return Err(Error::DecryptError);
++        };
++        if !self.state.eligible(n) {
++            return self.software.decrypt(msg, seq);
++        }
++        let mut nonce = Nonce::new(&self.salt, seq).0;
++        let mut aad = [0u8; 13];
++        let aad_len = if self.tls13 {
++            aad[..5].copy_from_slice(&make_tls13_aad(msg.payload.len()));
++            5
++        } else {
++            nonce[..4].copy_from_slice(&self.salt.as_ref()[..4]);
++            nonce[4..].copy_from_slice(&msg.payload[..8]);
++            aad.copy_from_slice(&make_tls12_aad(seq, msg.typ, msg.version, n));
++            13
++        };
++        match self
++            .state
++            .crypt_record(&nonce, &msg.payload[prefix..], &aad[..aad_len], true)
++        {
++            Some(Ok(plain)) => {
++                if !self.tls13 && plain.len() > 16384 {
++                    return Err(Error::PeerSentOversizedRecord);
++                }
++                msg.payload[..plain.len()].copy_from_slice(&plain);
++                msg.payload.truncate(plain.len());
++                if self.tls13 {
++                    msg.into_tls13_unpadded_message()
++                } else {
++                    Ok(msg.into_plain_message())
++                }
++            }
++            Some(Err(_)) => Err(Error::DecryptError),
++            None => self.software.decrypt(msg, seq),
++        }
++    }
++}
++
++static DEV_NOTICE: Once = Once::new();
++static AFALG_NOTICE: Once = Once::new();
++static FALLBACK_NOTICE: Once = Once::new();
++static SOFTWARE_NOTICE: Once = Once::new();
++struct State {
++    output: Zeroizing<Vec<u8>>,
++    key: Zeroizing<Vec<u8>>,
++    settings: Settings,
++    transport: Option<Box<dyn Transport>>,
++    dev_tried: bool,
++    disabled: bool,
++}
++impl State {
++    fn new(key: &[u8], settings: Settings) -> Self {
++        Self {
++            key: Zeroizing::new(key.to_vec()),
++            output: Zeroizing::new(Vec::new()),
++            settings,
++            transport: None,
++            dev_tried: false,
++            disabled: settings.backend == Backend::Off,
++        }
++    }
++    fn eligible(&self, n: usize) -> bool {
++        !self.disabled && (MIN..=MAX).contains(&n)
++    }
++    fn connect(&mut self) -> io::Result<()> {
++        if !self.dev_tried && self.settings.backend != Backend::Afalg {
++            self.dev_tried = true;
++            match self.verified(Backend::Devcrypto) {
++                Ok(t) => {
++                    DEV_NOTICE.call_once(|| tracing::info!("Quark EIP93: AES-GCM hybrid backend enabled (devcrypto CTR + CPU GHASH)"));
++                    self.transport = Some(t);
++                    return Ok(());
++                }
++                Err(e) if self.settings.backend == Backend::Devcrypto => return Err(e),
++                Err(e) => FALLBACK_NOTICE.call_once(|| tracing::warn!(error = %e, "Quark EIP93: devcrypto unavailable; trying AF_ALG")),
++            }
++        }
++        if self.settings.backend == Backend::Devcrypto {
++            return Err(io::ErrorKind::NotFound.into());
++        }
++        let t = self.verified(Backend::Afalg)?;
++        AFALG_NOTICE.call_once(|| {
++            tracing::info!("Quark EIP93: AES-GCM hybrid backend enabled (AF_ALG CTR + CPU GHASH)")
++        });
++        self.transport = Some(t);
++        self.settings.backend = Backend::Afalg;
++        Ok(())
++    }
++    fn verified(&self, backend: Backend) -> io::Result<Box<dyn Transport>> {
++        let mut t = (self.settings.open)(backend, &self.key)?;
++        selftest(t.as_mut(), &self.key)?;
++        Ok(t)
++    }
++    fn disable(&mut self, e: &io::Error) {
++        self.transport = None;
++        self.disabled = true;
++        self.key.zeroize();
++        SOFTWARE_NOTICE.call_once(
++            || tracing::warn!(error = %e, "Quark EIP93: backend unavailable; using ring software"),
++        );
++    }
++    // None means software fallback, Some(Err) means an authentication failure.
++    fn crypt_record(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++    ) -> Option<io::Result<Record<'_>>> {
++        let n = if decrypt {
++            src.len().checked_sub(TAG)?
++        } else {
++            src.len()
++        };
++        if !self.eligible(n) || aad.len() > 256 {
++            return None;
++        }
++        let expected = if decrypt { n } else { n + TAG };
++        if self.output.capacity() < MAX + TAG {
++            let additional = MAX + TAG - self.output.len();
++            self.output.reserve_exact(additional);
++        }
++        self.output.resize(expected, 0);
++        let written = loop {
++            if self.transport.is_none() {
++                if let Err(e) = self.connect() {
++                    self.disable(&e);
++                    return None;
++                }
++            }
++            let result = self.transport.as_mut().unwrap().exchange_into(
++                nonce,
++                src,
++                aad,
++                decrypt,
++                &mut self.output,
++            );
++            match result {
++                Ok(len) if len == expected => break len,
++                Err(e) if decrypt && e.raw_os_error() == Some(libc::EBADMSG) => {
++                    wipe(&mut self.output);
++                    return Some(Err(e));
++                }
++                other => {
++                    let e = other
++                        .err()
++                        .unwrap_or_else(|| io::Error::other("wrong EIP93 output length"));
++                    self.transport = None;
++                    wipe(&mut self.output);
++                    if self.settings.backend != Backend::Auto || !self.dev_tried {
++                        self.disable(&e);
++                        return None;
++                    }
++                    // Auto may fail over from devcrypto only once. An AF_ALG failure
++                    // permanently disables this key, avoiding a reconnect loop.
++                    self.settings.backend = Backend::Afalg;
++                    FALLBACK_NOTICE.call_once(|| tracing::warn!(error = %e, "Quark EIP93: devcrypto failed; trying AF_ALG"));
++                }
++            }
++        };
++        Some(Ok(Record(&mut self.output[..written])))
++    }
++    #[cfg(test)]
++    fn crypt(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++    ) -> Option<io::Result<Zeroizing<Vec<u8>>>> {
++        self.crypt_record(nonce, src, aad, decrypt)
++            .map(|r| r.map(|record| Zeroizing::new(record.to_vec())))
++    }
++}
++
++fn ring_key(key: &[u8]) -> aead::LessSafeKey {
++    let algorithm = if key.len() == 16 {
++        &aead::AES_128_GCM
++    } else {
++        &aead::AES_256_GCM
++    };
++    aead::LessSafeKey::new(aead::UnboundKey::new(algorithm, key).unwrap())
++}
++fn selftest(t: &mut dyn Transport, key: &[u8]) -> io::Result<()> {
++    let failed = || io::Error::other("EIP93 per-session verification failed");
++    let mut nonce = [0; 12];
++    SystemRandom::new().fill(&mut nonce).map_err(|_| failed())?;
++    let plain = Zeroizing::new((0..MIN).map(|i| (i * 7) as u8).collect::<Vec<_>>());
++    let aad = b"EIP93 selftest";
++    let mut expected = Zeroizing::new(plain.to_vec());
++    ring_key(key)
++        .seal_in_place_append_tag(
++            aead::Nonce::assume_unique_for_key(nonce),
++            aead::Aad::from(aad),
++            &mut *expected,
++        )
++        .map_err(|_| failed())?;
++    let mut actual = Zeroizing::new(vec![0; MIN + TAG]);
++    let n = t.exchange_into(&nonce, &plain, aad, false, &mut actual)?;
++    if n != expected.len() || actual[..n] != expected[..] {
++        return Err(failed());
++    }
++    let n = t.exchange_into(&nonce, &expected, aad, true, &mut actual)?;
++    if n != plain.len() || actual[..n] != plain[..] {
++        return Err(failed());
++    }
++    expected[MIN] ^= 1;
++    actual.fill(0xa5);
++    match t.exchange_into(&nonce, &expected, aad, true, &mut actual) {
++        Err(e) if e.raw_os_error() == Some(libc::EBADMSG) && actual.iter().all(|b| *b == 0xa5) => {
++            Ok(())
++        }
++        _ => Err(failed()),
++    }
++}
+--- a/src/eip93/testdata/ec-cert.pem
++++ b/src/eip93/testdata/ec-cert.pem
+@@ -0,0 +1,10 @@
++-----BEGIN CERTIFICATE-----
++MIIBajCCARCgAwIBAgIJALVpZF0HmJzyMAoGCCqGSM49BAMCMBQxEjAQBgNVBAMM
++CWxvY2FsaG9zdDAeFw0yNjExMDIwNjI0MzZaFw00NjEwMjgwNjI0MzZaMBQxEjAQ
++BgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFlkR7Y3
++0FtoLaO2Wxn+4lD8m6c2aHXRfVxIjy+9GRKI1WZHOTLDwX6rbiF8YbkVz2/Z/cGd
++n+cWzQyVRI10uTSjSzBJMBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAMBgNVHRMBAf8E
++AjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAKBggqhkjO
++PQQDAgNIADBFAiBhaawlpeNlVhcYRygk1I2ukzxM2kG4K23IT5wibcIfIAIhAOMy
++VL1Jd6+L1CfsH0UW5qSvdbMdCgq/xTV9f2Yq35am
++-----END CERTIFICATE-----
+--- a/src/eip93/testdata/ec-key.pem
++++ b/src/eip93/testdata/ec-key.pem
+@@ -0,0 +1,5 @@
++-----BEGIN PRIVATE KEY-----
++MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgKljg9wim2IjaFKMW
++aaife719qNkgbnWps0cenLo7YsKhRANCAARZZEe2N9BbaC2jtlsZ/uJQ/JunNmh1
++0X1cSI8vvRkSiNVmRzkyw8F+q24hfGG5Fc9v2f3BnZ/nFs0MlUSNdLk0
++-----END PRIVATE KEY-----
+--- a/src/eip93/testdata/rsa-cert.pem
++++ b/src/eip93/testdata/rsa-cert.pem
+@@ -0,0 +1,18 @@
++-----BEGIN CERTIFICATE-----
++MIIC9jCCAd6gAwIBAgIJAMrt4DRbn0mvMA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNV
++BAMMCWxvY2FsaG9zdDAeFw0yNjExMDIwNjI0MzZaFw00NjEwMjgwNjI0MzZaMBQx
++EjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC
++ggEBALl1c7jpUjRaxZmKxMQloNg8HHHi4PWeeqaax0EZugrdCmfB++4u4S6UEUDD
++4t0drkvm0ByvS3UpDwM4MsftY8Vz6jEed9LgL05Sm/nFpZTkdRATnBmiz0ocinYY
++/6KNW4WmK+5fqiWaPx8m4FpeU8JTJQyHeFhrPFvyCTcadiEyoX9CAZS4Q3LxQ9Ze
++WTtj2J+3zdOzz54AWrYeLZ7KYWWwex6V1vVaZjgw08MnRJmJXuzfLBcjvwP6LS11
++PZVE1cM0KW6S4ACSh+MQR6nyy77P8qdiI2T9jgQKrIykeSb5m80qNhZ/kRqNB6K8
++xpddCRE9M15t+VZbz4c3qQtyiDcCAwEAAaNLMEkwFAYDVR0RBA0wC4IJbG9jYWxo
++b3N0MAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsG
++AQUFBwMBMA0GCSqGSIb3DQEBCwUAA4IBAQApARaCbeuMq3jwMHGX18uf+zp4BsLp
++iFgDZQPenDAWkPJAMEoW11AxwcNv5Sn9rJOG9SdCgOtyRXLVEWcE0inB7Kl/XLhq
++oQyKnCaY+GaKafJCFSwaoxc5PaJNCoapiV8Hj6gkb4lpHGgbX5YNVaUVb/c5y8Mp
++H34PXqxrC7iHrB/vsJ3ZeZ44DreN7ypiByVxnr6bc007yBsvxsKXBrF+bB5c2sNL
++X8EzT/a8U2NSHEQssG3jV+NGOTzrwpfqeyFi22CujhIDOL09dRaCZCIgVR9dX4gZ
++faa+wzlUrJg3HSXOiz5fjSTJPtKbn85wamlm3KEhcG6wFY5BaJ9+cC+e
++-----END CERTIFICATE-----
+--- a/src/eip93/testdata/rsa-key.pem
++++ b/src/eip93/testdata/rsa-key.pem
+@@ -0,0 +1,28 @@
++-----BEGIN PRIVATE KEY-----
++MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC5dXO46VI0WsWZ
++isTEJaDYPBxx4uD1nnqmmsdBGboK3QpnwfvuLuEulBFAw+LdHa5L5tAcr0t1KQ8D
++ODLH7WPFc+oxHnfS4C9OUpv5xaWU5HUQE5wZos9KHIp2GP+ijVuFpivuX6olmj8f
++JuBaXlPCUyUMh3hYazxb8gk3GnYhMqF/QgGUuENy8UPWXlk7Y9ift83Ts8+eAFq2
++Hi2eymFlsHseldb1WmY4MNPDJ0SZiV7s3ywXI78D+i0tdT2VRNXDNClukuAAkofj
++EEep8su+z/KnYiNk/Y4ECqyMpHkm+ZvNKjYWf5EajQeivMaXXQkRPTNebflWW8+H
++N6kLcog3AgMBAAECggEATNR5gms2YPYR0lAIv/GOtsYASrXg2CA1U3vfe/q6dfGo
++c9+LDNti8jbpBtmfzFaVdGBEav271ueRjpXjg6u2n4Arzvl+TmANePcEIu9cb1hN
++nsFg88Xc9ijou5ATpzXEapOys2fyRu2lpLQoUYeuT1y+hnhAxPB36udUJf3SXmG0
++l7Kyah0x8plBh5qaQWuEKOtB52qMQIjzoph/oknG8zezkmyJblDDYTAaI2J1g0Cd
++mNhSsLVWiS9x60ZbuqZFUhCRvtONEkaC64nwaaoPtv9lPK0q9Ys9YL0387t+D1an
++wLXLLKO0V8ERnfYhfV5z7WMzSH0CVqSCh+poUoZGUQKBgQDiRmV0CVPFUk3G9E/L
++k+syzAWjDFJeAs3KnxPRlb8itTGfASKn9s+3dZr3WsQfqNQzYHIPE3sbzR04lQtN
++B3TG3jZXpGoELFGdmQTgpAZzWwpA33yjzyvYPu4AYfvnK/cxu8vilUy08NVAXd7Z
++EuOmnBpoBmeYH8ToOncmnV2lcwKBgQDR0mlihXS1zIA4xynvz5W2UuGRoATyjGHq
++B2yz7QuI8ZGsQHMg3Inf568xof5R5qLeoYxT+eimPtvyD8PFSKQP8ohfWFG+hm4D
++Qcuf3Y/tVzPEfMyguzG6LtgipMoVTReoP9IKicorPY/v3Gnq2CYE50/InMKiIF3T
++2l5BjI0BLQKBgFECUPodCL/BOpU7DIJe37qc7nu0QpzjthePokHLsdVUN4KsnmKx
++6yXMVgGunj6Ta/1EzzD0kYOfiJGkUppuS/GSxrPT6hy6XTHmAagHMUQFWQNmv7HJ
++zvGpff3nFo9p3yMQD+t79i1ld4OG1+yxZY1Vn+KUQGxnG1Dk9Zl+h3NfAoGARpuO
++By9t1PfadkDfZenvMYm2irDUuWJwWLbi57FvXkgcg2C03WwZoZVvqT4gPSNlz5GB
++jYjdt4QTs+OGN894Fj3BkoRADeNjBgmQIl4G3xGnRAnTOouD8mltJktaDc0BlwbT
++AeTYebCfzVHY+sR+FsxYVuQZw0EtEeu8KEbJ9IkCgYEAi9wyBJWiXC+uEQ9BFSFD
++Bcif4JHe46pvGCH8RWnzbA1emEjZ0WFMl8/Gu5Qv4tKeSHXvi2R4fyfoS5cwpjnV
++xgDFswm4H578R2Nx4cpXjflSWry6JwwZDIkK2z2I5C5a/TtQ3eS1jIs1/9FwJqIO
++RHyFtQve8HGUWrT3Pj/6cTo=
++-----END PRIVATE KEY-----
+--- a/src/eip93/tests.rs
++++ b/src/eip93/tests.rs
+@@ -0,0 +1,524 @@
++// Copyright 2026 The PonWrt Authors.
++// SPDX-License-Identifier: MIT
++use super::*;
++use std::{
++    io::{Read, Write},
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    },
++};
++
++fn settings(open: Open) -> Settings {
++    Settings {
++        backend: Backend::Auto,
++        open,
++    }
++}
++fn unavailable(_: Backend, _: &[u8]) -> io::Result<Box<dyn Transport>> {
++    Err(io::Error::from_raw_os_error(libc::ENOENT))
++}
++pub(super) struct SoftwareTransport {
++    key: aead::LessSafeKey,
++    calls: Arc<AtomicUsize>,
++    fail: Option<i32>,
++}
++impl Transport for SoftwareTransport {
++    fn exchange_into(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++        dst: &mut [u8],
++    ) -> io::Result<usize> {
++        self.calls.fetch_add(1, Ordering::Relaxed);
++        if let Some(errno) = self.fail {
++            return Err(io::Error::from_raw_os_error(errno));
++        }
++        let mut out = Zeroizing::new(src.to_vec());
++        let nonce = aead::Nonce::assume_unique_for_key(*nonce);
++        if decrypt {
++            let n = self
++                .key
++                .open_in_place(nonce, aead::Aad::from(aad), &mut out)
++                .map_err(|_| io::Error::from_raw_os_error(libc::EBADMSG))?
++                .len();
++            out[n..].zeroize();
++            out.truncate(n);
++        } else {
++            self.key
++                .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut *out)
++                .map_err(|_| io::Error::other("ring seal"))?;
++        }
++        dst[..out.len()].copy_from_slice(&out);
++        Ok(out.len())
++    }
++}
++pub(super) fn software(key: &[u8]) -> SoftwareTransport {
++    SoftwareTransport {
++        key: ring_key(key),
++        calls: Arc::new(AtomicUsize::new(0)),
++        fail: None,
++    }
++}
++fn model_open(_: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++    Ok(Box::new(software(key)))
++}
++
++#[test]
++fn device_and_policy_gates() {
++    for good in [
++        b"airoha,an7581\0".as_slice(),
++        b"nokia,xg-040g-md\0airoha,en7581\0",
++    ] {
++        assert!(compatible(good));
++    }
++    for bad in [
++        b"".as_slice(),
++        b"airoha,an7581",
++        b"vendor,an7581\0",
++        b"airoha,an75810\0",
++        b"airoha,an7581\0airoha,an7583\0",
++        b"airoha,en7583\0",
++    ] {
++        assert!(!compatible(bad));
++    }
++    for (input, want) in [
++        ("", Backend::Auto),
++        ("auto", Backend::Auto),
++        ("devcrypto", Backend::Devcrypto),
++        ("afalg", Backend::Afalg),
++        ("off", Backend::Off),
++        ("typo", Backend::Off),
++    ] {
++        assert_eq!(Backend::parse(input), want);
++    }
++    #[cfg(not(target_arch = "aarch64"))]
++    assert!(!supported_device());
++}
++
++#[test]
++fn per_session_verification_rejects_bad_cipher_and_bad_authentication() {
++    let mut good = software(&[17; 32]);
++    selftest(&mut good, &[17; 32]).unwrap();
++    assert_eq!(good.calls.load(Ordering::Relaxed), 3);
++    assert!(selftest(&mut software(&[18; 32]), &[17; 32]).is_err());
++    struct Forged;
++    impl Transport for Forged {
++        fn exchange_into(
++            &mut self,
++            _: &[u8; 12],
++            src: &[u8],
++            _: &[u8],
++            _: bool,
++            dst: &mut [u8],
++        ) -> io::Result<usize> {
++            dst[..src.len()].copy_from_slice(src);
++            Ok(src.len())
++        }
++    }
++    assert!(selftest(&mut Forged, &[17; 32]).is_err());
++    fn invalid(_: Backend, _: &[u8]) -> io::Result<Box<dyn Transport>> {
++        Ok(Box::new(Forged))
++    }
++    let mut state = State::new(&[17; 32], settings(invalid));
++    assert!(state.crypt(&[0; 12], &[0; MIN], b"aad", false).is_none());
++    assert!(state.disabled);
++    assert!(state.key.iter().all(|b| *b == 0));
++}
++
++#[test]
++fn boundaries_authentication_and_failure_fallback() {
++    let key = [29; 32];
++    let mut state = State::new(&key, settings(model_open));
++    let nonce = [19; 12];
++    for n in [0, 1, MIN - 1, MIN, MIN + 1, 16384, MAX, MAX + 1] {
++        let plain = vec![37; n];
++        let result = state.crypt(&nonce, &plain, b"aad", false);
++        if !(MIN..=MAX).contains(&n) {
++            assert!(result.is_none());
++            continue;
++        }
++        let out = result.unwrap().unwrap();
++        let back = state.crypt(&nonce, &out, b"aad", true).unwrap().unwrap();
++        assert_eq!(*back, plain);
++        for (bad_nonce, bad_aad, bad_tag) in [
++            (true, false, false),
++            (false, true, false),
++            (false, false, true),
++        ] {
++            let mut corrupt_nonce = nonce;
++            let mut corrupt = out.to_vec();
++            if bad_nonce {
++                corrupt_nonce[0] ^= 1;
++            }
++            if bad_tag {
++                *corrupt.last_mut().unwrap() ^= 1;
++            }
++            let result = state.crypt(
++                &corrupt_nonce,
++                &corrupt,
++                if bad_aad { b"bad" } else { b"aad" },
++                true,
++            );
++            assert!(result.unwrap().is_err());
++            assert!(!state.disabled);
++            assert!(state.transport.is_some());
++        }
++        assert_eq!(
++            *state.crypt(&nonce, &out, b"aad", true).unwrap().unwrap(),
++            plain
++        );
++    }
++    assert!(state.crypt(&nonce, &[0; MIN], &[0; 257], false).is_none());
++    let mut dead = software(&key);
++    dead.fail = Some(libc::EIO);
++    state.transport = Some(Box::new(dead));
++    state.dev_tried = true;
++    state.settings.backend = Backend::Auto;
++    // Runtime devcrypto failure switches auto to an independently verified AF_ALG backend.
++    assert!(
++        state
++            .crypt(&nonce, &[0; MIN], b"aad", false)
++            .unwrap()
++            .is_ok()
++    );
++    assert_eq!(state.settings.backend, Backend::Afalg);
++    let mut dead = software(&key);
++    dead.fail = Some(libc::EIO);
++    state.transport = Some(Box::new(dead));
++    assert!(state.crypt(&nonce, &[0; MIN], b"aad", false).is_none());
++    assert!(state.disabled);
++    // Explicit devcrypto never tries AF_ALG after an operational failure.
++    let mut state = State::new(
++        &key,
++        Settings {
++            backend: Backend::Devcrypto,
++            open: model_open,
++        },
++    );
++    let mut dead = software(&key);
++    dead.fail = Some(libc::EIO);
++    state.transport = Some(Box::new(dead));
++    assert!(state.crypt(&nonce, &[0; MIN], b"aad", false).is_none());
++    assert!(state.disabled);
++}
++
++#[test]
++fn shared_threshold_and_record_buffer_reuse() {
++    for backend in [Backend::Devcrypto, Backend::Afalg] {
++        for key in [vec![29; 16], vec![29; 32]] {
++            let mut state = State::new(
++                &key,
++                Settings {
++                    backend,
++                    open: model_open,
++                },
++            );
++            assert!(
++                state
++                    .crypt_record(&[0; 12], &[0; 8191], b"aad", false)
++                    .is_none()
++            );
++            assert!(state.transport.is_none());
++            assert_eq!(state.output.capacity(), 0);
++            let mut allocation = None;
++            for (seq, n) in [8192, 16384, MAX, 8193, 8192].into_iter().enumerate() {
++                let nonce = [seq as u8; 12];
++                let input = vec![37; n];
++                let encrypted = {
++                    let record = state
++                        .crypt_record(&nonce, &input, b"aad", false)
++                        .unwrap()
++                        .unwrap();
++                    record.to_vec()
++                };
++                let ptr = state.output.as_ptr();
++                assert_eq!(*allocation.get_or_insert(ptr), ptr);
++                assert!(state.output.iter().all(|b| *b == 0));
++                {
++                    let record = state
++                        .crypt_record(&nonce, &encrypted, b"aad", true)
++                        .unwrap()
++                        .unwrap();
++                    assert_eq!(&*record, &input);
++                }
++                assert_eq!(state.output.as_ptr(), ptr);
++                assert!(state.output.iter().all(|b| *b == 0));
++                let mut bad = encrypted.clone();
++                *bad.last_mut().unwrap() ^= 1;
++                assert!(matches!(
++                    state.crypt_record(&nonce, &bad, b"aad", true).unwrap(),
++                    Err(e) if e.raw_os_error() == Some(libc::EBADMSG)
++                ));
++                assert!(!state.disabled);
++                assert!(state.output.iter().all(|b| *b == 0));
++                assert_eq!(state.output.as_ptr(), ptr);
++                assert_eq!(input, vec![37; n]);
++            }
++        }
++    }
++}
++
++fn pem(pem: &str) -> Vec<u8> {
++    use base64::Engine;
++    let text: String = pem.lines().filter(|s| !s.starts_with("---")).collect();
++    base64::engine::general_purpose::STANDARD
++        .decode(text)
++        .unwrap()
++}
++fn pump(client: &mut rustls::ClientConnection, server: &mut rustls::ServerConnection) {
++    for _ in 0..16 {
++        let mut moved = false;
++        if client.wants_write() {
++            let mut data = Vec::new();
++            client.write_tls(&mut data).unwrap();
++            let mut input = &data[..];
++            while !input.is_empty() {
++                assert!(server.read_tls(&mut input).unwrap() > 0);
++                server.process_new_packets().unwrap();
++            }
++            moved = true;
++        }
++        if server.wants_write() {
++            let mut data = Vec::new();
++            server.write_tls(&mut data).unwrap();
++            let mut input = &data[..];
++            while !input.is_empty() {
++                assert!(client.read_tls(&mut input).unwrap() > 0);
++                client.process_new_packets().unwrap();
++            }
++            moved = true;
++        }
++        if !moved {
++            return;
++        }
++    }
++    panic!("TLS failed to converge");
++}
++static KERNEL_DATA_CALLS: AtomicUsize = AtomicUsize::new(0);
++static KERNEL_CALLS: AtomicUsize = AtomicUsize::new(0);
++struct CountKernel(Box<dyn Transport>);
++impl Transport for CountKernel {
++    fn exchange_into(
++        &mut self,
++        nonce: &[u8; 12],
++        src: &[u8],
++        aad: &[u8],
++        decrypt: bool,
++        dst: &mut [u8],
++    ) -> io::Result<usize> {
++        KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
++        let result = self.0.exchange_into(nonce, src, aad, decrypt, dst);
++        if result.is_ok() && src.len() > MIN + TAG {
++            KERNEL_DATA_CALLS.fetch_add(1, Ordering::Relaxed);
++        }
++        result
++    }
++}
++// Host tests explicitly request the generic kernel driver; production always
++// binds/validates EIP93. No environment variable can enable this test override.
++#[cfg(all(
++    target_os = "linux",
++    target_pointer_width = "64",
++    target_endian = "little",
++    any(target_arch = "aarch64", target_arch = "x86_64")
++))]
++fn generic_open(backend: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++    Ok(Box::new(CountKernel(linux::open_generic(backend, key)?)))
++}
++fn interop(open: Open) {
++    for suite in rustls::crypto::ring::default_provider().cipher_suites {
++        if format!("{:?}", suite.suite()).contains("CHACHA20") {
++            continue;
++        }
++        let rsa = matches!(
++            suite.suite(),
++            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
++                | CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
++        );
++        let (cert, key) = if rsa {
++            (
++                include_str!("testdata/rsa-cert.pem"),
++                include_str!("testdata/rsa-key.pem"),
++            )
++        } else {
++            (
++                include_str!("testdata/ec-cert.pem"),
++                include_str!("testdata/ec-key.pem"),
++            )
++        };
++        let cert = rustls::pki_types::CertificateDer::from(pem(cert));
++        for accelerated_client in [true, false] {
++            let mut accelerated = provider(settings(open));
++            accelerated
++                .cipher_suites
++                .retain(|s| s.suite() == suite.suite());
++            let mut standard = rustls::crypto::ring::default_provider();
++            standard
++                .cipher_suites
++                .retain(|s| s.suite() == suite.suite());
++            let (cp, sp) = if accelerated_client {
++                (accelerated, standard)
++            } else {
++                (standard, accelerated)
++            };
++            let mut roots = rustls::RootCertStore::empty();
++            roots.add(cert.clone()).unwrap();
++            let cc = rustls::ClientConfig::builder_with_provider(Arc::new(cp))
++                .with_protocol_versions(&[suite.version()])
++                .unwrap()
++                .with_root_certificates(roots)
++                .with_no_client_auth();
++            let sc = rustls::ServerConfig::builder_with_provider(Arc::new(sp))
++                .with_protocol_versions(&[suite.version()])
++                .unwrap()
++                .with_no_client_auth()
++                .with_single_cert(
++                    vec![cert.clone()],
++                    rustls::pki_types::PrivatePkcs8KeyDer::from(pem(key)).into(),
++                )
++                .unwrap();
++            let mut c =
++                rustls::ClientConnection::new(Arc::new(cc), "localhost".try_into().unwrap())
++                    .unwrap();
++            let mut s = rustls::ServerConnection::new(Arc::new(sc)).unwrap();
++            c.set_buffer_limit(None);
++            s.set_buffer_limit(None);
++            pump(&mut c, &mut s);
++            assert!(!c.is_handshaking() && !s.is_handshaking());
++            assert_eq!(c.negotiated_cipher_suite().unwrap().suite(), suite.suite());
++            // Mix software and kernel-sized records, multi-record payloads and
++            // sequence-number changes on both directions of the same connection.
++            for size in [
++                0, 1, 1024, 4095, 4096, 4097, 8190, 8191, 8192, 8193, 16384, 32769,
++            ] {
++                let input: Vec<u8> = (0..size).map(|i| (i * 31) as u8).collect();
++                c.writer().write_all(&input).unwrap();
++                pump(&mut c, &mut s);
++                let mut received = vec![0; size];
++                s.reader().read_exact(&mut received).unwrap();
++                assert_eq!(received, input, "upload {:?}", suite.suite());
++                s.writer().write_all(&input).unwrap();
++                pump(&mut c, &mut s);
++                c.reader().read_exact(&mut received).unwrap();
++                assert_eq!(received, input, "download {:?}", suite.suite());
++            }
++            if suite.version() == &rustls::version::TLS13 {
++                c.refresh_traffic_keys().unwrap();
++                pump(&mut c, &mut s);
++                let input = vec![89; 16384];
++                c.writer().write_all(&input).unwrap();
++                pump(&mut c, &mut s);
++                let mut received = vec![0; input.len()];
++                s.reader().read_exact(&mut received).unwrap();
++                assert_eq!(received, input);
++            }
++        }
++    }
++}
++#[test]
++fn tls12_tls13_ring_interoperability_and_software_fallback() {
++    interop(unavailable);
++}
++#[test]
++fn tls12_tls13_ring_interoperability_with_model() {
++    interop(model_open);
++}
++
++#[test]
++#[ignore = "requires Linux AF_ALG gcm_base(ctr(aes-generic),ghash-generic)"]
++#[cfg(all(
++    target_os = "linux",
++    target_pointer_width = "64",
++    target_endian = "little",
++    any(target_arch = "aarch64", target_arch = "x86_64")
++))]
++fn kernel_afalg_tls_interoperability() {
++    // Fail instead of silently passing via software when the kernel path is unavailable.
++    for key in [vec![7; 16], vec![7; 32]] {
++        let mut t = generic_open(Backend::Afalg, &key).unwrap();
++        selftest(t.as_mut(), &key).unwrap();
++    }
++    std::thread::scope(|scope| {
++        for worker in 0..8 {
++            scope.spawn(move || {
++                let key = vec![worker + 1; 32];
++                let mut t = generic_open(Backend::Afalg, &key).unwrap();
++                selftest(t.as_mut(), &key).unwrap();
++                for sequence in 0..20 {
++                    let nonce = [sequence; 12];
++                    let plain = vec![worker; 16384];
++                    let out = t.exchange(&nonce, &plain, b"aad", false).unwrap();
++                    assert_eq!(*t.exchange(&nonce, &out, b"aad", true).unwrap(), plain);
++                    let mut corrupt = out.to_vec(); *corrupt.last_mut().unwrap() ^= 1;
++                    assert!(matches!(t.exchange(&nonce, &corrupt, b"aad", true), Err(e) if e.raw_os_error() == Some(libc::EBADMSG)));
++                    assert!(t.exchange(&[sequence ^ 0x80; 12], &out, b"aad", true).is_err());
++                    assert!(t.exchange(&nonce, &out, b"bad", true).is_err());
++                    assert_eq!(*t.exchange(&nonce, &out, b"aad", true).unwrap(), plain);
++                }
++            });
++        }
++    });
++    let before = KERNEL_DATA_CALLS.load(Ordering::Relaxed);
++    interop(generic_open);
++    assert!(KERNEL_DATA_CALLS.load(Ordering::Relaxed) > before + 50);
++}
++
++#[test]
++#[ignore = "run on AN7581/EN7581 with working EIP93 and cryptodev/AF_ALG"]
++fn hardware_tls_interoperability() {
++    assert!(supported_device(), "requires AN7581 without CPU AES");
++    let backend = Backend::parse(&std::env::var("QUARK_EIP93").unwrap_or_default());
++    assert!(
++        matches!(backend, Backend::Devcrypto | Backend::Afalg),
++        "select QUARK_EIP93=devcrypto or afalg explicitly"
++    );
++    fn required_open(backend: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++        let selected = Backend::parse(&std::env::var("QUARK_EIP93").unwrap());
++        if backend != selected {
++            return Err(io::ErrorKind::Unsupported.into());
++        }
++        // Panic makes unavailable hardware fail the test instead of software fallback.
++        Ok(Box::new(CountKernel(open(backend, key).unwrap())))
++    }
++    for key in [vec![7; 16], vec![7; 32]] {
++        let mut t = open(backend, &key).unwrap();
++        selftest(t.as_mut(), &key).unwrap();
++    }
++    let before = KERNEL_DATA_CALLS.load(Ordering::Relaxed);
++    interop(required_open);
++    assert!(KERNEL_DATA_CALLS.load(Ordering::Relaxed) > before + 50);
++}
++
++#[test]
++fn tls_runtime_failure_preserves_input_for_software_fallback() {
++    struct FailAfterSelftest {
++        inner: SoftwareTransport,
++        count: usize,
++    }
++    impl Transport for FailAfterSelftest {
++        fn exchange_into(
++            &mut self,
++            nonce: &[u8; 12],
++            src: &[u8],
++            aad: &[u8],
++            decrypt: bool,
++            dst: &mut [u8],
++        ) -> io::Result<usize> {
++            self.count += 1;
++            if self.count > 3 {
++                return Err(io::Error::from_raw_os_error(libc::EIO));
++            }
++            self.inner.exchange_into(nonce, src, aad, decrypt, dst)
++        }
++    }
++    fn fail(_: Backend, key: &[u8]) -> io::Result<Box<dyn Transport>> {
++        Ok(Box::new(FailAfterSelftest {
++            inner: software(key),
++            count: 0,
++        }))
++    }
++    interop(fail);
++}

@@ -118,6 +118,8 @@ make package/luci-app-quarkdrive-webdav/compile V=s
 
 后端源码从上游 [chenqimiao/quarkdrive-webdav](https://github.com/chenqimiao/quarkdrive-webdav) 下载，版本及固定提交由 `net/quarkdrive-webdav/Makefile` 指定。旁边的本地源码目录不参与默认下载构建；修改本地源码不会自动改变 GitHub 构建结果。
 
+后端包通过 `net/quarkdrive-webdav/patches/` 加入 AN7581/EN7581 的 EIP93 AES-GCM TLS 加速，默认自动检测设备，并在硬件不可用时回退到软件。仅影响本进程处理的 HTTPS 流量。配置、内核依赖与验证状态见 [EIP93 说明](net/quarkdrive-webdav/README.eip93.md)。
+
 ## GitHub Actions 编译与发布
 
 流水线参考 `luci-app-shellinabox`，使用 `openwrt/gh-action-sdk@v11`，SDK 版本为 `25.12.5`，保留以下六个架构：

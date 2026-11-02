@@ -26,7 +26,10 @@ procd_open_instance() {
     printf 'instance\n' >> "$QD_TEST_DIR/events"
 }
 procd_set_param() { :; }
-procd_append_param() { :; }
+procd_append_param() {
+    [ "$1" != env ] || printf '%s\n' "$@" >> "$QD_TEST_DIR/events"
+    return 0
+}
 procd_close_instance() { :; }
 procd_add_reload_trigger() { printf 'trigger\n' >> "$QD_TEST_DIR/events"; }
 set_running() {
@@ -181,6 +184,13 @@ class InitTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn('stop', events)
                     self.assertTrue(state)
+
+    def test_legacy_backend_setting_does_not_control_service_start(self):
+        for value in ['auto', 'devcrypto', 'afalg', 'off', 'invalid']:
+            with self.subTest(value=value):
+                result, events, _, _ = self.run_action('start_now', eip93=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any('QUARK_EIP93=' in event for event in events))
 
     def test_failed_start_validation_is_propagated_through_rc_common(self):
         result, events, waits, state = self.run_action('start', '1', quark_cookie='')

@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=quarkdrive-webdav
 PKG_VERSION:=1.3.9
-PKG_RELEASE:=1
+PKG_RELEASE:=4
 
 # Match the source revision in feed/quarkdrive-webdav; pin it for reproducibility.
 PKG_SOURCE_VERSION:=7a88d7f1fa299a6ef75b99d7e5dbc07a717f579e
@@ -14,8 +14,8 @@ PKG_HASH:=6e6457ae3459c41acb112d1848c1d690eca50168da84b17d3eb5bf0143f289df
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_SOURCE_VERSION)
 
 PKG_MAINTAINER:=Qimiao Chen <chenqimiao1994@126.com>
-PKG_LICENSE:=MIT
-PKG_LICENSE_FILES:=LICENSE
+PKG_LICENSE:=MIT BSD-3-Clause
+PKG_LICENSE_FILES:=LICENSE src/eip93/LICENSE.rustls src/eip93/LICENSE.xray
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
 
@@ -31,7 +31,11 @@ define Package/quarkdrive-webdav
   SUBMENU:=Web Servers/Proxies
   TITLE:=WebDAV server for QuarkDrive
   URL:=https://github.com/chenqimiao/quarkdrive-webdav
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle \
+	+TARGET_airoha_an7581:kmod-crypto-hw-eip93 \
+	+TARGET_airoha_an7581:kmod-crypto-gcm \
+	+TARGET_airoha_an7581:kmod-crypto-user \
+	+TARGET_airoha_an7581:kmod-cryptodev
 endef
 
 define Package/quarkdrive-webdav/description
